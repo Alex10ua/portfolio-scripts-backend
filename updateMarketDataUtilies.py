@@ -1,7 +1,7 @@
 
 def get_yearly_dividend(stock_info, ticker):
     try:
-        yearly_dividend = stock_info.get('dividendRate')
+        yearly_dividend = stock_info.get('dividendRate') or ''
     except Exception as e:
         print('Error getting yearly dividend for {}: {}'.format(ticker, e))
         yearly_dividend = None
@@ -9,7 +9,7 @@ def get_yearly_dividend(stock_info, ticker):
 
 def get_last_dividend_payment(stock_info, ticker):
     try:
-        last_div_payment = stock_info.get('lastDividendValue')
+        last_div_payment = stock_info.get('lastDividendValue') or ''
     except Exception as e:
         print('Error getting last dividend for {}: {}'.format(ticker, e))
         last_div_payment = None
@@ -44,7 +44,7 @@ def get_dividends(dividends_series, ticker):
         dividends = [
             {'dividendDate': date, 'dividendAmount': dividend}
             for date, dividend in dividends_series.items()
-        ]
+        ] or ''
 
     except Exception as e:
         print(f"Error getting dividends for {ticker}: {e}")
@@ -56,7 +56,7 @@ def get_splits(splits_series, ticker):
         splits = [
         {'splitDate': date, 'ratioSplit': split}
            for date, split in splits_series.items()
-        ]
+        ] or ''
     except Exception as e:
            print(f"Error getting splits for {ticker}: {e}")
            splits = []
@@ -64,7 +64,7 @@ def get_splits(splits_series, ticker):
 
 def get_stock_country(stock_info, ticker):
     try:
-        county = stock_info.get('country')
+        county = stock_info.get('country') or ''
     except Exception as e:
         print('Error getting country for {}: {}'.format(ticker, e))
         county = None
@@ -72,7 +72,7 @@ def get_stock_country(stock_info, ticker):
 
 def get_sector(stock_info, ticker):
     try:
-        sector = stock_info.get('sector')
+        sector = stock_info.get('sector') or ''
     except Exception as e:
         print('Error getting sectore for {}: {}'.format(ticker, e))
         sector = None
@@ -80,7 +80,7 @@ def get_sector(stock_info, ticker):
 
 def get_industry(stock_info, ticker):
     try:
-        industry = stock_info.get('industry')
+        industry = stock_info.get('industry') or ''
     except Exception as e:
         print('Error getting industry for {}: {}'.format(ticker, e))
         industry = None
