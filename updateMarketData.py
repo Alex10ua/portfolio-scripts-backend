@@ -16,9 +16,8 @@ def insert_or_update_market_data(ticker):
     # Create the data to update
     market_data = {
         'name': updateMarketDataUtilies.get_company_name(stock.info ,ticker),
-        'price': updateMarketDataUtilies.get_company_name(stock.info, ticker),
+        'price': updateMarketDataUtilies.get_current_price(stock.info, ticker),
         'priceYesterday': updateMarketDataUtilies.get_close_price(stock.info, ticker),
-        'dividendFrequency': updateMarketDataUtilies.get_dividend_frequency(stock.info, ticker),
         'yearlyDividend': updateMarketDataUtilies.get_yearly_dividend(stock.info, ticker),
         'lastDividendPayment': updateMarketDataUtilies.get_last_dividend_payment(stock.info, ticker),
         'dividends': updateMarketDataUtilies.get_dividends(stock.dividends, ticker),
@@ -43,6 +42,6 @@ def insert_or_update_market_data(ticker):
 
 # Example usage
 if __name__ == "__main__":
-    ticker_symbols = ['AAPL', 'MSFT', 'GOOGL', 'ACOMO.AS']  # Replace with desired ticker symbol
+    ticker_symbols = ['AAPL', 'MSFT', 'GOOGL', 'ACOMO.AS', 'META', 'BHP', 'CAJPY', 'CKHUY', 'FPAFY']  # Replace with desired ticker symbol
     for ticker_symbol in ticker_symbols:
         insert_or_update_market_data(ticker_symbol)

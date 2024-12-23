@@ -15,14 +15,6 @@ def get_last_dividend_payment(stock_info, ticker):
         last_div_payment = None
     return last_div_payment
 
-def get_dividend_frequency(stock_info, ticker):
-    try:
-        dividend_frequency = stock_info.get('dividendRate') % stock_info.get('lastDividendValue')
-    except Exception as e:
-        print('Error getting company name for {}: {}'.format(ticker, e))
-        dividend_frequency = None
-    return dividend_frequency
-
 def get_company_name(stock_info, ticker):
     try:
         name = stock_info.get('longName') or stock_info.get('shortName') or ''
