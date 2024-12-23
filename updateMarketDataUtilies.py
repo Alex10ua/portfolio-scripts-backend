@@ -85,3 +85,11 @@ def get_industry(stock_info, ticker):
         print('Error getting industry for {}: {}'.format(ticker, e))
         industry = None
     return industry
+
+def get_currency(stock_info, ticker):
+    try:
+        currency = stock_info.get('currency')
+    except Exception as e:
+        print('Error getting currency for {}: {}'.format(ticker, e))
+        currency = None
+    return currency

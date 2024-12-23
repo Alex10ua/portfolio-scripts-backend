@@ -17,6 +17,7 @@ def insert_or_update_market_data(ticker):
     market_data = {
         'name': updateMarketDataUtilies.get_company_name(stock.info ,ticker),
         'price': updateMarketDataUtilies.get_current_price(stock.info, ticker),
+        'currency': updateMarketDataUtilies.get_currency(stock.info, ticker),
         'priceYesterday': updateMarketDataUtilies.get_close_price(stock.info, ticker),
         'yearlyDividend': updateMarketDataUtilies.get_yearly_dividend(stock.info, ticker),
         'lastDividendPayment': updateMarketDataUtilies.get_last_dividend_payment(stock.info, ticker),
