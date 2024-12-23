@@ -42,6 +42,6 @@ def insert_or_update_market_data(ticker):
 
 # Example usage
 if __name__ == "__main__":
-    ticker_symbols = ['AAPL', 'MSFT', 'GOOGL', 'ACOMO.AS', 'META', 'BHP', 'CAJPY', 'CKHUY', 'FPAFY']  # Replace with desired ticker symbol
+    ticker_symbols = ['AAPL', 'MSFT', 'GOOGL', 'ACOMO.AS', 'META', 'BHP', 'CAJPY', 'CKHUY', 'FPAFY', 'AMZN']  # Replace with desired ticker symbol
     for ticker_symbol in ticker_symbols:
         insert_or_update_market_data(ticker_symbol)
