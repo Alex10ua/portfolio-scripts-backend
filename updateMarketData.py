@@ -1,6 +1,9 @@
+from flask import Flask, jsonify, request
+from time import sleep
 import yfinance as yf
 from pymongo import MongoClient
 from datetime import datetime
+import threading
 
 import updateMarketDataUtilies
 
@@ -8,6 +11,14 @@ import updateMarketDataUtilies
 client = MongoClient('mongodb://root:secret@localhost:27017/')
 db = client['portfolio']  # Replace with your database name
 collection = db['marketData']
+tickers_collection = db['tickers']
+# Global variable to hold our Timer object
+debounce_timer = None
+# Lock to synchronize access to the timer
+lock = threading.Lock()
+
+app = Flask(__name__)
+
 
 def insert_or_update_market_data(ticker):
     # Fetch data using yfinance
@@ -41,8 +52,51 @@ def insert_or_update_market_data(ticker):
     else:
         print(f"Inserted new data for {ticker}")
 
-# Example usage
-if __name__ == "__main__":
-    ticker_symbols = ['AAPL', 'MSFT', 'GOOGL', 'ACOMO.AS', 'META', 'BHP', 'CAJPY', 'CKHUY', 'FPAFY', 'AMZN']  # Replace with desired ticker symbol
-    for ticker_symbol in ticker_symbols:
-        insert_or_update_market_data(ticker_symbol)
+def run_task():
+    global debounce_timer
+    with lock:
+        debounce_timer = None
+        # Retrieve ticker symbols from MongoDB
+        ticker_symbols = []
+        result_ticker_search = tickers_collection.find({})
+        for ticker in result_ticker_search:
+            ticker_symbol = ticker.get('ticker')
+            if ticker_symbol not in ticker_symbols:
+                ticker_symbols.append(ticker_symbol)
+
+        total = len(ticker_symbols)
+        for i, ticker_symbol in enumerate(ticker_symbols, start=1):
+            message = f"Processing ticker {i} of {total}: {ticker_symbol}"
+            print(message)
+            sleep(1)  # Be aware: this will block the request; consider removing or running asynchronously.
+            insert_or_update_market_data(ticker_symbol)
+            result = tickers_collection.delete_one({"ticker": ticker_symbol})
+            if result.deleted_count > 0:
+                print(f"Ticker {ticker_symbol} was deleted.")
+            else:
+                print(f"Ticker {ticker_symbol} not found.")
+
+    print("Task executed at", threading.current_thread().name)
+
+@app.route('/update_all', methods=['POST'])
+def update_all():
+    print('triggered')
+    global debounce_timer
+    with lock:
+        # If a timer is already running, cancel it
+        if debounce_timer is not None:
+            debounce_timer.cancel()
+        # Create a new timer that will run the task after 2 minutes (120 seconds)
+        debounce_timer = threading.Timer(10, run_task())
+        debounce_timer.start()
+    return '', 202
+
+@app.route('/update_one', methods=['POST'])
+def update_all():
+    data = request.get_json()
+    ticker = data['ticker']
+    insert_or_update_market_data(ticker)
+    return jsonify({"status": "received", "ticker": ticker}), 200
+
+if __name__ == '__main__':
+    app.run(debug=True)

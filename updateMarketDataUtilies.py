@@ -33,7 +33,7 @@ def get_current_price(stock_info, ticker):
 
 def get_close_price(stock_info, ticker):
     try:
-        price_at_close = stock_info.get('previousClose') or ''
+        price_at_close = stock_info.get('previousClose') or stock_info.get('currentPrice')
     except Exception as e:
         print(f"Error getting price at close for {ticker}: {e}")
         price_at_close = None
@@ -44,7 +44,7 @@ def get_dividends(dividends_series, ticker):
         dividends = [
             {'dividendDate': date, 'dividendAmount': dividend}
             for date, dividend in dividends_series.items()
-        ] or ''
+        ] or []
 
     except Exception as e:
         print(f"Error getting dividends for {ticker}: {e}")
@@ -56,7 +56,7 @@ def get_splits(splits_series, ticker):
         splits = [
         {'splitDate': date, 'ratioSplit': split}
            for date, split in splits_series.items()
-        ] or ''
+        ] or []
     except Exception as e:
            print(f"Error getting splits for {ticker}: {e}")
            splits = []
