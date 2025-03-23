@@ -92,7 +92,7 @@ def update_all():
     return '', 202
 
 @app.route('/update_one', methods=['POST'])
-def update_all():
+def update_one():
     data = request.get_json()
     ticker = data['ticker']
     insert_or_update_market_data(ticker)
