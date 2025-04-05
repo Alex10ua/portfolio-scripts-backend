@@ -8,7 +8,7 @@ import threading
 import updateMarketDataUtilies
 
 # MongoDB connection
-client = MongoClient('mongodb://root:secret@localhost:27017/')
+client = MongoClient('mongodb://root:secret@mongodb:27017/')
 db = client['portfolio']  # Replace with your database name
 collection = db['marketData']
 tickers_collection = db['tickers']
@@ -92,11 +92,11 @@ def update_all():
     return '', 202
 
 @app.route('/update_one', methods=['POST'])
-def update_all():
+def update_one():
     data = request.get_json()
     ticker = data['ticker']
     insert_or_update_market_data(ticker)
     return jsonify({"status": "received", "ticker": ticker}), 200
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0')
