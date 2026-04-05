@@ -64,17 +64,17 @@ def get_splits(splits_series, ticker):
 
 def get_stock_country(stock_info, ticker):
     try:
-        county = stock_info.get('country') or ''
+        country = stock_info.get('country') or ''
     except Exception as e:
         print('Error getting country for {}: {}'.format(ticker, e))
-        county = None
-    return county
+        country = None
+    return country
 
 def get_sector(stock_info, ticker):
     try:
         sector = stock_info.get('sector') or ''
     except Exception as e:
-        print('Error getting sectore for {}: {}'.format(ticker, e))
+        print('Error getting sector for {}: {}'.format(ticker, e))
         sector = None
     return sector
 
