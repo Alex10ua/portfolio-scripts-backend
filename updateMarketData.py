@@ -76,6 +76,7 @@ def process_ticker(ticker: str, provider_fn) -> tuple[str, UpdateOne | None, str
             {'$set': market_data},
             upsert=True,
         )
+        get_price_history(ticker)
         return ticker, operation, None
     except Exception as e:
         return ticker, None, str(e)
@@ -96,6 +97,7 @@ def insert_or_update_market_data(ticker: str, provider_fn) -> dict:
             else:
                 msg = f"Inserted new data for {ticker}"
             print(msg)
+            get_price_history(ticker)
             return {"success": True, "message": msg}
         except Exception as e:
             error_msg = f"Error writing to DB for {ticker}: {e}"
