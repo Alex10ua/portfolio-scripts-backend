@@ -19,6 +19,7 @@ client = MongoClient(MONGO_URI)
 db = client['portfolio']
 collection = db['marketData']
 tickers_collection = db['tickers']
+price_history_collection = db['priceHistoryCache']
 
 # Per-provider debounce state
 debounce_timers = {"yahoo": None, "massive": None, "auto": None}
@@ -210,6 +211,36 @@ def update_auto():
 @app.route('/update/massive', methods=['POST'])
 def update_massive():
     return _handle_update("massive", massive_provider.fetch_market_data)
+
+
+def get_price_history(ticker: str) -> bool:
+    """Fetch full price history from yfinance and store it in MongoDB. Returns True on success."""
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period='max')
+        if hist.empty:
+            return False
+        entries = [
+            {'date': str(idx.date()), 'price': round(float(row['Close']), 4)}
+            for idx, row in hist.iterrows()
+        ]
+        price_history_collection.update_one(
+            {'_id': ticker},
+            {'$set': {'ticker': ticker, 'history': entries, 'lastUpdated': datetime.now().strftime('%Y-%m-%d')}},
+            upsert=True,
+        )
+        return True
+    except Exception as e:
+        print(f'[price_history] Error fetching {ticker}: {e}')
+        return False
+
+
+@app.route('/history/refresh/<ticker>', methods=['POST'])
+def refresh_price_history(ticker):
+    success = get_price_history(ticker)
+    if success:
+        return jsonify({'status': 'ok', 'ticker': ticker}), 200
+    return jsonify({'status': 'error', 'ticker': ticker}), 500
 
 
 if __name__ == '__main__':
