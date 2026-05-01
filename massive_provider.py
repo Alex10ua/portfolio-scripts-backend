@@ -47,6 +47,7 @@ def _map_response(ticker: str, data: dict) -> dict:
         'lastDividendPayment': data.get('lastDividendPayment') or '',
         'dividends': dividends,
         'splits': splits,
+        'currency': data.get('currency') or '',
         'country': data.get('country') or '',
         'sector': data.get('sector') or '',
         'industry': data.get('industry') or '',

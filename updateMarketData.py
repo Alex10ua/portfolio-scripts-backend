@@ -10,6 +10,7 @@ import os
 import updateMarketDataUtilities
 import massive_provider
 import finnhub_provider
+import ecb_provider
 
 load_dotenv()
 
@@ -235,6 +236,16 @@ def get_price_history(ticker: str) -> bool:
     except Exception as e:
         print(f'[price_history] Error fetching {ticker}: {e}')
         return False
+
+
+@app.route('/update/exchangeRates', methods=['POST'])
+def update_exchange_rates():
+    try:
+        rates = ecb_provider.fetch_and_store_rates(db)
+        return jsonify({'status': 'ok', 'currencies': list(rates.keys())}), 200
+    except Exception as e:
+        print(f'[exchangeRates] Error: {e}')
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
 
 @app.route('/history/refresh/<ticker>', methods=['POST'])
