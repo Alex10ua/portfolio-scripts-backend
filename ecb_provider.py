@@ -27,6 +27,8 @@ def fetch_and_store_rates(db) -> dict:
     # Always include EUR itself
     rates["EUR"] = 1.0
 
+    # exchangeRates document schema (must match Java FxRate model):
+    # { _id: str, currency: str, rateVsEur: float, date: str (YYYY-MM-DD), updatedAt: datetime (UTC) }
     now = datetime.now(timezone.utc)
     for currency, rate in rates.items():
         collection.update_one(
@@ -34,7 +36,7 @@ def fetch_and_store_rates(db) -> dict:
             {"$set": {
                 "currency": currency,
                 "rateVsEur": rate,
-                "date": datetime.utcnow().strftime("%Y-%m-%d"),
+                "date": now.strftime("%Y-%m-%d"),
                 "updatedAt": now,
             }},
             upsert=True,
