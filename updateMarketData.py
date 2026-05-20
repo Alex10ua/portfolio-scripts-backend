@@ -256,5 +256,51 @@ def refresh_price_history(ticker):
     return jsonify({'status': 'error', 'ticker': ticker}), 500
 
 
+def get_monthly_price_history(ticker: str) -> bool:
+    """Fetch monthly price history from yfinance and store in MongoDB. Returns True on success."""
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period='max', interval='1mo')
+        if hist.empty:
+            return False
+        entries = [
+            {'date': str(idx.date())[:7], 'price': round(float(row['Close']), 4)}
+            for idx, row in hist.iterrows()
+        ]
+        price_history_collection.update_one(
+            {'_id': ticker},
+            {'$set': {'monthlyHistory': entries, 'lastUpdated': datetime.now().strftime('%Y-%m-%d')}},
+            upsert=True,
+        )
+        return True
+    except Exception as e:
+        print(f'[monthly_price_history] Error fetching {ticker}: {e}')
+        return False
+
+
+@app.route('/update/full', methods=['POST'])
+def update_full():
+    """Manually trigger a full update for a ticker: price, dividends, splits, daily history, monthly history."""
+    data = request.get_json(silent=True) or {}
+    ticker = data.get('ticker')
+    if not ticker:
+        return jsonify({'status': 'error', 'error': 'ticker required'}), 400
+
+    result = insert_or_update_market_data(ticker, yahoo_fetch_market_data)
+    if not result['success']:
+        return jsonify({'status': 'error', 'error': result['error'], 'ticker': ticker}), 500
+
+    daily_ok = get_price_history(ticker)
+    monthly_ok = get_monthly_price_history(ticker)
+
+    return jsonify({
+        'status': 'success',
+        'ticker': ticker,
+        'marketData': result['message'],
+        'dailyHistory': 'ok' if daily_ok else 'failed',
+        'monthlyHistory': 'ok' if monthly_ok else 'failed',
+    }), 200
+
+
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0')
