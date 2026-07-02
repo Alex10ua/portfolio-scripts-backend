@@ -5,6 +5,7 @@ from pymongo import MongoClient, UpdateOne, DeleteOne
 from datetime import datetime
 import threading
 import concurrent.futures
+import time
 import os
 
 import updateMarketDataUtilities
@@ -41,14 +42,35 @@ debounce_timers = {"yahoo": None, "massive": None, "auto": None, "crypto": None}
 locks = {"yahoo": threading.Lock(), "massive": threading.Lock(),
          "auto": threading.Lock(), "crypto": threading.Lock()}
 
+# Throttled sequential batch — one run at a time
+throttled_lock = threading.Lock()
+throttled_status = {
+    "running": False,
+    "total": 0,
+    "processed": 0,
+    "updated": 0,
+    "failed": [],
+    "startedAt": None,
+    "finishedAt": None,
+}
+
 app = Flask(__name__)
 
 
-def yahoo_fetch_market_data(ticker: str) -> dict:
-    """Fetch full market data from Yahoo Finance."""
+def yahoo_fetch_market_data(ticker: str, request_pause: float = 0) -> dict:
+    """
+    Fetch full market data from Yahoo Finance in two requests: .info (quoteSummary)
+    and one history(period='max') download that serves dividends, splits AND the
+    daily price history. The history DataFrame rides along under '_history'
+    (popped by process_ticker before the DB write, reused by get_price_history).
+    request_pause sleeps between the two requests.
+    """
     stock = yf.Ticker(ticker)
     info = stock.info
-    return {
+    if request_pause > 0:
+        time.sleep(request_pause)
+    hist = stock.history(period='max')  # .dividends/.splits below reuse this download
+    data = {
         'name': updateMarketDataUtilities.get_company_name(info, ticker),
         'price': updateMarketDataUtilities.get_current_price(info, ticker),
         'currency': updateMarketDataUtilities.get_currency(info, ticker),
@@ -63,6 +85,11 @@ def yahoo_fetch_market_data(ticker: str) -> dict:
         'sharesOutstanding': updateMarketDataUtilities.get_shares_outstanding(info, ticker),
         'updatedAt': datetime.now(),
     }
+    # price history can only reuse this download when the history symbol matches
+    # the ticker (crypto tickers map BTC -> BTC-USD for history)
+    if yahoo_crypto_symbol(ticker) == ticker:
+        data['_history'] = hist
+    return data
 
 
 def _merge_list(existing: list, new: list, key: str) -> list:
@@ -74,13 +101,16 @@ def _merge_list(existing: list, new: list, key: str) -> list:
     return list(merged.values())
 
 
-def process_ticker(ticker: str, provider_fn) -> tuple[str, UpdateOne | None, str | None]:
+def process_ticker(ticker: str, provider_fn, request_pause: float = 0) -> tuple[str, UpdateOne | None, str | None]:
     """
     Fetches data for a single ticker using the given provider and returns the update operation.
+    request_pause sleeps between the provider fetch and the price-history request.
     Returns: (ticker, update_op, error_message)
     """
     try:
         market_data = provider_fn(ticker)
+        # DataFrame piggybacked by yahoo_fetch_market_data — not BSON, must not reach $set
+        hist = market_data.pop('_history', None)
         existing = collection.find_one({'ticker': ticker}, {'dividends': 1, 'splits': 1}) or {}
         market_data['dividends'] = _merge_list(
             existing.get('dividends') or [], market_data.get('dividends') or [], 'dividendDate'
@@ -93,7 +123,12 @@ def process_ticker(ticker: str, provider_fn) -> tuple[str, UpdateOne | None, str
             {'$set': market_data},
             upsert=True,
         )
-        get_price_history(ticker)
+        if hist is not None:
+            get_price_history(ticker, hist)  # reuse download — no new Yahoo request
+        else:
+            if request_pause > 0:
+                time.sleep(request_pause)
+            get_price_history(ticker)
         return ticker, operation, None
     except Exception as e:
         return ticker, None, str(e)
@@ -119,7 +154,7 @@ def insert_or_update_market_data(ticker: str, provider_fn) -> dict:
             else:
                 msg = f"Inserted new data for {ticker}"
             print(msg)
-            get_price_history(ticker)
+            # price history already stored by process_ticker — no second fetch
             return {"success": True, "message": msg}
         except Exception as e:
             error_msg = f"Error writing to DB for {ticker}: {e}"
@@ -262,11 +297,15 @@ def update_crypto():
     return _handle_update("crypto", crypto_provider.fetch_market_data)
 
 
-def get_price_history(ticker: str) -> bool:
-    """Fetch full price history from yfinance and store it in MongoDB. Returns True on success."""
+def get_price_history(ticker: str, hist=None) -> bool:
+    """
+    Store full daily price history in MongoDB. Fetches from yfinance unless a
+    pre-downloaded history DataFrame is passed in. Returns True on success.
+    """
     try:
-        stock = yf.Ticker(yahoo_crypto_symbol(ticker))
-        hist = stock.history(period='max')
+        if hist is None:
+            stock = yf.Ticker(yahoo_crypto_symbol(ticker))
+            hist = stock.history(period='max')
         if hist.empty:
             return False
         entries = [
@@ -420,6 +459,109 @@ def update_full():
     }), 200
 
 
+def run_throttled_task(pause_seconds: float):
+    """
+    Sequential batch over the tickers queue via Yahoo Finance, sleeping between
+    tickers to stay under rate limits. Each ticker is written to marketData and
+    removed from the queue immediately, so an interrupted run loses nothing.
+    """
+    try:
+        cursor = tickers_collection.find({}, {'ticker': 1})
+        ticker_symbols: list[str] = list(set(str(doc.get('ticker')) for doc in cursor if doc.get('ticker')))
+
+        # Custom asset tickers never get provider updates — drop them from the queue unprocessed.
+        custom_tickers = get_custom_tickers()
+        skipped_custom = [t for t in ticker_symbols if t in custom_tickers]
+        if skipped_custom:
+            ticker_symbols = [t for t in ticker_symbols if t not in custom_tickers]
+            tickers_collection.delete_many({'ticker': {'$in': skipped_custom}})
+            print(f"[throttled] Skipped {len(skipped_custom)} custom asset tickers: {skipped_custom}")
+
+        total = len(ticker_symbols)
+        with throttled_lock:
+            throttled_status.update({
+                "total": total, "processed": 0, "updated": 0, "failed": [],
+                "startedAt": datetime.now().isoformat(), "finishedAt": None,
+            })
+
+        print(f"[{datetime.now()}] [throttled] Starting sequential update of {total} tickers "
+              f"({pause_seconds}s pause between every Yahoo request)...")
+
+        # pause threaded through the fetch chain: info -> combined history download
+        # (dividends + splits + daily prices in one request), plus between tickers below
+        def throttled_yahoo_fetch(t: str) -> dict:
+            return yahoo_fetch_market_data(t, request_pause=pause_seconds)
+
+        for i, ticker in enumerate(ticker_symbols, 1):
+            if i > 1:
+                time.sleep(pause_seconds)
+
+            processed_ticker, operation, error = process_ticker(
+                ticker, throttled_yahoo_fetch, request_pause=pause_seconds)
+
+            if operation:
+                try:
+                    collection.bulk_write([operation])
+                    tickers_collection.delete_many({'ticker': processed_ticker})
+                    print(f"[throttled] [{i}/{total}] Updated {processed_ticker}")
+                    with throttled_lock:
+                        throttled_status["updated"] += 1
+                except Exception as e:
+                    print(f"[throttled] [{i}/{total}] DB error for {processed_ticker}: {e}")
+                    with throttled_lock:
+                        throttled_status["failed"].append(processed_ticker)
+            else:
+                print(f"[throttled] [{i}/{total}] Failed to fetch {processed_ticker}: {error}")
+                with throttled_lock:
+                    throttled_status["failed"].append(processed_ticker)
+
+            with throttled_lock:
+                throttled_status["processed"] = i
+
+        print(f"[{datetime.now()}] [throttled] Task finished.")
+    finally:
+        with throttled_lock:
+            throttled_status["running"] = False
+            throttled_status["finishedAt"] = datetime.now().isoformat()
+
+
+@app.route('/update/throttled', methods=['POST'])
+def update_throttled():
+    """
+    Start a background sequential update of every ticker in the 'tickers' queue,
+    pausing between Yahoo Finance calls (default 15 s, override via {"pauseSeconds": N}).
+    Returns immediately; poll GET /update/throttled/status for progress.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        pause_seconds = float(data.get('pauseSeconds', 15))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "error": "pauseSeconds must be a number"}), 400
+    if pause_seconds < 0:
+        return jsonify({"status": "error", "error": "pauseSeconds must be >= 0"}), 400
+
+    with throttled_lock:
+        if throttled_status["running"]:
+            return jsonify({
+                "status": "already_running",
+                "processed": throttled_status["processed"],
+                "total": throttled_status["total"],
+            }), 409
+        throttled_status["running"] = True
+
+    threading.Thread(target=run_throttled_task, args=[pause_seconds], daemon=True).start()
+    return jsonify({
+        "status": "started",
+        "message": f"Throttled Yahoo batch started ({pause_seconds}s pause between every Yahoo request)",
+    }), 202
+
+
+@app.route('/update/throttled/status', methods=['GET'])
+def update_throttled_status():
+    with throttled_lock:
+        return jsonify(dict(throttled_status)), 200
+
+
 # ---------- Swagger UI (manual endpoint testing) ----------
 
 TICKER_BODY = {
@@ -501,6 +643,27 @@ OPENAPI_SPEC = {
                 'requestBody': TICKER_BODY,
                 'responses': {'200': {'description': '{requested, updated, created[], failed[]}'},
                               '500': {'description': 'DB error'}},
+            },
+        },
+        '/update/throttled': {
+            'post': {
+                'summary': 'Background sequential Yahoo update of the whole tickers queue, pausing between every Yahoo request (default 15 s)',
+                'requestBody': {
+                    'required': False,
+                    'content': {'application/json': {'schema': {
+                        'type': 'object',
+                        'properties': {'pauseSeconds': {'type': 'number', 'example': 15}},
+                    }}},
+                },
+                'responses': {'202': {'description': 'Batch started in background'},
+                              '400': {'description': 'Invalid pauseSeconds'},
+                              '409': {'description': 'A throttled batch is already running'}},
+            },
+        },
+        '/update/throttled/status': {
+            'get': {
+                'summary': 'Progress of the current/last throttled batch',
+                'responses': {'200': {'description': '{running, total, processed, updated, failed[], startedAt, finishedAt}'}},
             },
         },
         '/update/exchangeRates': {
