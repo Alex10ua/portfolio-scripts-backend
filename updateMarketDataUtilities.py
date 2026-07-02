@@ -93,3 +93,11 @@ def get_currency(stock_info, ticker):
         print('Error getting currency for {}: {}'.format(ticker, e))
         currency = None
     return currency
+
+def get_shares_outstanding(stock_info, ticker):
+    try:
+        shares = stock_info.get('sharesOutstanding') or stock_info.get('impliedSharesOutstanding')
+        return int(shares) if shares else None
+    except Exception as e:
+        print('Error getting shares outstanding for {}: {}'.format(ticker, e))
+        return None

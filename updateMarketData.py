@@ -45,6 +45,7 @@ def yahoo_fetch_market_data(ticker: str) -> dict:
         'country': updateMarketDataUtilities.get_stock_country(info, ticker),
         'sector': updateMarketDataUtilities.get_sector(info, ticker),
         'industry': updateMarketDataUtilities.get_industry(info, ticker),
+        'sharesOutstanding': updateMarketDataUtilities.get_shares_outstanding(info, ticker),
         'updatedAt': datetime.now(),
     }
 
