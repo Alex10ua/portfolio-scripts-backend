@@ -11,6 +11,7 @@ import updateMarketDataUtilities
 import massive_provider
 import finnhub_provider
 import ecb_provider
+import crypto_provider
 
 load_dotenv()
 
@@ -21,10 +22,24 @@ db = client['portfolio']
 collection = db['marketData']
 tickers_collection = db['tickers']
 price_history_collection = db['priceHistoryCache']
+custom_assets_collection = db['customAssets']
+holdings_collection = db['holdings']
+
+
+def get_custom_tickers() -> set:
+    """
+    User-defined CUSTOM asset tickers (customAssets collection). Market providers must
+    never update these: their marketData docs hold user-set prices, and names can
+    collide with real exchange tickers (e.g. custom "S" vs SentinelOne).
+    """
+    return set(
+        doc['ticker'] for doc in custom_assets_collection.find({}, {'ticker': 1}) if doc.get('ticker')
+    )
 
 # Per-provider debounce state
-debounce_timers = {"yahoo": None, "massive": None, "auto": None}
-locks = {"yahoo": threading.Lock(), "massive": threading.Lock(), "auto": threading.Lock()}
+debounce_timers = {"yahoo": None, "massive": None, "auto": None, "crypto": None}
+locks = {"yahoo": threading.Lock(), "massive": threading.Lock(),
+         "auto": threading.Lock(), "crypto": threading.Lock()}
 
 app = Flask(__name__)
 
@@ -89,6 +104,11 @@ def insert_or_update_market_data(ticker: str, provider_fn) -> dict:
     Immediate single-ticker update using the given provider.
     Returns a dict with success status and message/error.
     """
+    if ticker in get_custom_tickers():
+        msg = f"Skipping {ticker}: custom asset ticker, market data only updated for stock/crypto"
+        print(msg)
+        return {"success": False, "error": msg}
+
     ticker_result, operation, error = process_ticker(ticker, provider_fn)
 
     if operation:
@@ -120,6 +140,14 @@ def run_task(provider_fn, provider_key: str):
 
     cursor = tickers_collection.find({}, {'ticker': 1})
     ticker_symbols: list[str] = list(set(str(doc.get('ticker')) for doc in cursor if doc.get('ticker')))
+
+    # Custom asset tickers never get provider updates — drop them from the queue unprocessed.
+    custom_tickers = get_custom_tickers()
+    skipped_custom = [t for t in ticker_symbols if t in custom_tickers]
+    if skipped_custom:
+        ticker_symbols = [t for t in ticker_symbols if t not in custom_tickers]
+        tickers_collection.delete_many({'ticker': {'$in': skipped_custom}})
+        print(f"Skipped {len(skipped_custom)} custom asset tickers: {skipped_custom}")
 
     total = len(ticker_symbols)
     if total == 0:
@@ -194,11 +222,23 @@ def _handle_update(provider_key: str, provider_fn):
         schedule_batch(provider_key, provider_fn)
         return jsonify({"status": "debounced", "message": f"{provider_key.capitalize()} batch update scheduled in 10 seconds"}), 202
 
+def is_crypto_ticker(ticker: str) -> bool:
+    """True when any holding marks this ticker as CRYPTO."""
+    return holdings_collection.find_one({'ticker': ticker, 'assetType': 'CRYPTO'}) is not None
+
+
+def yahoo_crypto_symbol(ticker: str) -> str:
+    """yfinance needs pair form for crypto: 'BTC' -> 'BTC-USD'; 'BTC-EUR' and stocks pass through."""
+    if is_crypto_ticker(ticker) and '-' not in ticker:
+        return f'{ticker}-USD'
+    return ticker
+
+
 #need to find better provider for US ticker than massive and finnhub beacause they not free friendly
 def auto_fetch_market_data(ticker: str) -> dict:
-    """Route to Finnhub for US tickers (no dot suffix), yfinance for non-US."""
-    if '.' in ticker:
-        return yahoo_fetch_market_data(ticker)
+    """Route by asset type: CRYPTO holdings -> CoinGecko, everything else -> Yahoo Finance."""
+    if is_crypto_ticker(ticker):
+        return crypto_provider.fetch_market_data(ticker)
     return yahoo_fetch_market_data(ticker)
 
 
@@ -217,10 +257,15 @@ def update_massive():
     return _handle_update("massive", massive_provider.fetch_market_data)
 
 
+@app.route('/update/crypto', methods=['POST'])
+def update_crypto():
+    return _handle_update("crypto", crypto_provider.fetch_market_data)
+
+
 def get_price_history(ticker: str) -> bool:
     """Fetch full price history from yfinance and store it in MongoDB. Returns True on success."""
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(yahoo_crypto_symbol(ticker))
         hist = stock.history(period='max')
         if hist.empty:
             return False
@@ -251,16 +296,88 @@ def update_exchange_rates():
 
 @app.route('/history/refresh/<ticker>', methods=['POST'])
 def refresh_price_history(ticker):
+    if ticker in get_custom_tickers():
+        return jsonify({'status': 'skipped', 'reason': 'custom asset ticker', 'ticker': ticker}), 200
     success = get_price_history(ticker)
     if success:
         return jsonify({'status': 'ok', 'ticker': ticker}), 200
     return jsonify({'status': 'error', 'ticker': ticker}), 500
 
 
+def fetch_shares_outstanding(ticker: str):
+    """Fetch only sharesOutstanding for a ticker from Yahoo Finance."""
+    stock = yf.Ticker(ticker)
+    return updateMarketDataUtilities.get_shares_outstanding(stock.info, ticker)
+
+
+@app.route('/update/sharesOutstanding', methods=['POST'])
+def update_shares_outstanding():
+    """
+    Backfill sharesOutstanding: single ticker via {"ticker": "..."} body,
+    or every existing marketData doc when body is empty.
+    Unknown tickers get a full new marketData doc (which includes sharesOutstanding).
+    """
+    data = request.get_json(silent=True) or {}
+    ticker = data.get('ticker')
+    if ticker:
+        tickers = [ticker]
+    else:
+        tickers = list(set(
+            doc['ticker'] for doc in collection.find({}, {'ticker': 1}) if doc.get('ticker')
+        ))
+
+    # custom asset tickers hold user-set data — never fetch provider data for them
+    custom_tickers = get_custom_tickers()
+    skipped = [t for t in tickers if t in custom_tickers]
+    tickers = [t for t in tickers if t not in custom_tickers]
+
+    existing = set(
+        doc['ticker'] for doc in collection.find({'ticker': {'$in': tickers}}, {'ticker': 1})
+    )
+
+    def backfill_one(t: str) -> str:
+        """Returns 'updated' | 'created' | 'failed'."""
+        if t in existing:
+            if is_crypto_ticker(t):
+                shares = crypto_provider.fetch_market_data(t).get('sharesOutstanding')
+            else:
+                shares = fetch_shares_outstanding(t)
+            if not shares:
+                return 'failed'
+            collection.update_one({'ticker': t}, {'$set': {'sharesOutstanding': shares}})
+            return 'updated'
+        # ticker not in marketData yet — create the full doc, sharesOutstanding included
+        result = insert_or_update_market_data(t, auto_fetch_market_data)
+        return 'created' if result['success'] else 'failed'
+
+    updated, created, failed = [], [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_ticker = {executor.submit(backfill_one, t): t for t in tickers}
+        for future in concurrent.futures.as_completed(future_to_ticker):
+            t = future_to_ticker[future]
+            try:
+                outcome = future.result()
+            except Exception as e:
+                print(f'[sharesOutstanding] Error processing {t}: {e}')
+                outcome = 'failed'
+            {'updated': updated, 'created': created, 'failed': failed}[outcome].append(t)
+
+    print(f'[sharesOutstanding] updated={len(updated)} created={len(created)} '
+          f'skippedCustom={len(skipped)} failed={len(failed)}')
+    return jsonify({
+        'status': 'ok',
+        'requested': len(tickers),
+        'updated': len(updated),
+        'created': created,
+        'skippedCustom': skipped,
+        'failed': failed,
+    }), 200
+
+
 def get_monthly_price_history(ticker: str) -> bool:
     """Fetch monthly price history from yfinance and store in MongoDB. Returns True on success."""
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(yahoo_crypto_symbol(ticker))
         hist = stock.history(period='max', interval='1mo')
         if hist.empty:
             return False
@@ -301,6 +418,141 @@ def update_full():
         'dailyHistory': 'ok' if daily_ok else 'failed',
         'monthlyHistory': 'ok' if monthly_ok else 'failed',
     }), 200
+
+
+# ---------- Swagger UI (manual endpoint testing) ----------
+
+TICKER_BODY = {
+    'required': False,
+    'content': {
+        'application/json': {
+            'schema': {
+                'type': 'object',
+                'properties': {'ticker': {'type': 'string', 'example': 'AAPL'}},
+            },
+        },
+    },
+    'description': 'With "ticker": immediate single-ticker update. Without: debounced batch over the tickers queue.',
+}
+
+OPENAPI_SPEC = {
+    'openapi': '3.0.3',
+    'info': {
+        'title': 'Portfolio Market Data Service',
+        'description': 'Flask service fetching market data (Yahoo Finance, Massive, ECB) into MongoDB.',
+        'version': '1.0.0',
+    },
+    'paths': {
+        '/update/yahoo': {
+            'post': {
+                'summary': 'Update market data via Yahoo Finance',
+                'requestBody': TICKER_BODY,
+                'responses': {'200': {'description': 'Single ticker updated'},
+                              '202': {'description': 'Batch scheduled (10 s debounce)'},
+                              '500': {'description': 'Fetch or DB error'}},
+            },
+        },
+        '/update/auto': {
+            'post': {
+                'summary': 'Update market data via auto-routed provider (CRYPTO holdings -> CoinGecko, else Yahoo)',
+                'requestBody': TICKER_BODY,
+                'responses': {'200': {'description': 'Single ticker updated'},
+                              '202': {'description': 'Batch scheduled (10 s debounce)'},
+                              '500': {'description': 'Fetch or DB error'}},
+            },
+        },
+        '/update/massive': {
+            'post': {
+                'summary': 'Update market data via Massive API',
+                'requestBody': TICKER_BODY,
+                'responses': {'200': {'description': 'Single ticker updated'},
+                              '202': {'description': 'Batch scheduled (10 s debounce)'},
+                              '500': {'description': 'Fetch or DB error'}},
+            },
+        },
+        '/update/crypto': {
+            'post': {
+                'summary': 'Update market data via CoinGecko (crypto tickers, e.g. BTC or BTC-USD)',
+                'requestBody': TICKER_BODY,
+                'responses': {'200': {'description': 'Single ticker updated'},
+                              '202': {'description': 'Batch scheduled (10 s debounce)'},
+                              '500': {'description': 'Fetch or DB error'}},
+            },
+        },
+        '/update/full': {
+            'post': {
+                'summary': 'Full update for one ticker: market data + daily + monthly price history',
+                'requestBody': {
+                    'required': True,
+                    'content': {'application/json': {'schema': {
+                        'type': 'object',
+                        'required': ['ticker'],
+                        'properties': {'ticker': {'type': 'string', 'example': 'AAPL'}},
+                    }}},
+                },
+                'responses': {'200': {'description': 'Update result per part'},
+                              '400': {'description': 'ticker required'},
+                              '500': {'description': 'Fetch or DB error'}},
+            },
+        },
+        '/update/sharesOutstanding': {
+            'post': {
+                'summary': 'Backfill sharesOutstanding (single ticker, or all marketData docs when body empty); unknown tickers get a full new marketData doc created',
+                'requestBody': TICKER_BODY,
+                'responses': {'200': {'description': '{requested, updated, created[], failed[]}'},
+                              '500': {'description': 'DB error'}},
+            },
+        },
+        '/update/exchangeRates': {
+            'post': {
+                'summary': 'Fetch EUR FX rates from ECB into exchangeRates collection',
+                'responses': {'200': {'description': 'Currencies updated'},
+                              '500': {'description': 'Fetch error'}},
+            },
+        },
+        '/history/refresh/{ticker}': {
+            'post': {
+                'summary': 'Refresh full daily price history for a ticker',
+                'parameters': [{
+                    'name': 'ticker', 'in': 'path', 'required': True,
+                    'schema': {'type': 'string'}, 'example': 'AAPL',
+                }],
+                'responses': {'200': {'description': 'History stored'},
+                              '500': {'description': 'Fetch failed or empty history'}},
+            },
+        },
+    },
+}
+
+SWAGGER_UI_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Market Data Service — Swagger UI</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    SwaggerUIBundle({
+      url: '/apispec.json',
+      dom_id: '#swagger-ui',
+      tryItOutEnabled: true,
+    });
+  </script>
+</body>
+</html>"""
+
+
+@app.route('/apispec.json')
+def apispec():
+    return jsonify(OPENAPI_SPEC)
+
+
+@app.route('/apidocs')
+def apidocs():
+    return SWAGGER_UI_HTML
 
 
 if __name__ == '__main__':

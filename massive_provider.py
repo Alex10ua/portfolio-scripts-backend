@@ -51,5 +51,6 @@ def _map_response(ticker: str, data: dict) -> dict:
         'country': data.get('country') or '',
         'sector': data.get('sector') or '',
         'industry': data.get('industry') or '',
+        'sharesOutstanding': data.get('sharesOutstanding'),
         'updatedAt': datetime.now(),
     }
