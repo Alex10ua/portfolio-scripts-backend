@@ -57,6 +57,25 @@ throttled_status = {
 app = Flask(__name__)
 
 
+def get_shares_with_fallback(ticker: str, info: dict):
+    """
+    sharesOutstanding from the ticker's own Yahoo info. IOB GDR listings (".IL",
+    e.g. MHPC.IL) carry price but omit sharesOutstanding — fall back to the sibling
+    LSE listing (".L", e.g. MHPC.L), which reports it. GDRs are typically 1:1 with
+    the underlying, so the sibling's count is the right figure for the ownership math.
+    """
+    shares = updateMarketDataUtilities.get_shares_outstanding(info, ticker)
+    if shares is None and ticker.upper().endswith('.IL'):
+        sibling = ticker[:-3] + '.L'
+        try:
+            shares = updateMarketDataUtilities.get_shares_outstanding(yf.Ticker(sibling).info, sibling)
+            if shares:
+                print(f'[sharesOutstanding] {ticker}: filled from {sibling} = {shares}')
+        except Exception as e:
+            print(f'[sharesOutstanding] {ticker}: {sibling} fallback failed: {e}')
+    return shares
+
+
 def yahoo_fetch_market_data(ticker: str, request_pause: float = 0) -> dict:
     """
     Fetch full market data from Yahoo Finance in two requests: .info (quoteSummary)
@@ -82,7 +101,7 @@ def yahoo_fetch_market_data(ticker: str, request_pause: float = 0) -> dict:
         'country': updateMarketDataUtilities.get_stock_country(info, ticker),
         'sector': updateMarketDataUtilities.get_sector(info, ticker),
         'industry': updateMarketDataUtilities.get_industry(info, ticker),
-        'sharesOutstanding': updateMarketDataUtilities.get_shares_outstanding(info, ticker),
+        'sharesOutstanding': get_shares_with_fallback(ticker, info),
         'updatedAt': datetime.now(),
     }
     # price history can only reuse this download when the history symbol matches
@@ -344,9 +363,9 @@ def refresh_price_history(ticker):
 
 
 def fetch_shares_outstanding(ticker: str):
-    """Fetch only sharesOutstanding for a ticker from Yahoo Finance."""
+    """Fetch only sharesOutstanding for a ticker from Yahoo Finance (IOB .IL → .L fallback)."""
     stock = yf.Ticker(ticker)
-    return updateMarketDataUtilities.get_shares_outstanding(stock.info, ticker)
+    return get_shares_with_fallback(ticker, stock.info)
 
 
 @app.route('/update/sharesOutstanding', methods=['POST'])
