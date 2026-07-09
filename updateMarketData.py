@@ -25,6 +25,7 @@ tickers_collection = db['tickers']
 price_history_collection = db['priceHistoryCache']
 custom_assets_collection = db['customAssets']
 holdings_collection = db['holdings']
+shares_history_collection = db['sharesOutstandingHistory']
 
 
 def get_custom_tickers() -> set:
@@ -111,12 +112,55 @@ def yahoo_fetch_market_data(ticker: str, request_pause: float = 0) -> dict:
     return data
 
 
+def record_shares_history(ticker: str, shares) -> None:
+    """
+    Append {date, shares} to the ticker's sharesOutstandingHistory doc, but only
+    when the value differs from the last recorded one — a sparse time series of
+    share-count changes (buybacks/dilution; circulating supply for crypto).
+    A second change on the same day replaces that day's entry. Best-effort:
+    never raises, so a history failure can't break the marketData write.
+    """
+    if not shares:
+        return
+    try:
+        shares = int(shares)
+        today = datetime.now().strftime('%Y-%m-%d')
+        doc = shares_history_collection.find_one({'_id': ticker}, {'history': {'$slice': -1}})
+        last_entries = (doc or {}).get('history') or []
+        if last_entries:
+            last = last_entries[-1]
+            if last.get('shares') == shares:
+                return
+            if last.get('date') == today:
+                shares_history_collection.update_one({'_id': ticker}, {'$pop': {'history': 1}})
+        shares_history_collection.update_one(
+            {'_id': ticker},
+            {'$push': {'history': {'date': today, 'shares': shares}},
+             '$set': {'ticker': ticker, 'lastUpdated': today}},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f'[sharesHistory] Error recording {ticker}: {e}')
+
+
+def _day_key(value) -> str:
+    """Normalize a date-ish value (tz-aware Timestamp, naive datetime, or string)
+    to a 'YYYY-MM-DD' string so entries from different providers/reads dedup as
+    the same day. Mongo returns naive datetimes while yfinance yields tz-aware
+    Timestamps — as raw dict keys they never compare equal."""
+    if hasattr(value, 'strftime'):
+        return value.strftime('%Y-%m-%d')
+    return str(value)[:10]
+
+
 def _merge_list(existing: list, new: list, key: str) -> list:
-    """Merge two lists of dicts, deduplicating by key. New entries overwrite old on conflict."""
-    merged = {item[key]: item for item in existing if item.get(key)}
+    """Merge two lists of dicts, deduplicating by calendar day of `key`.
+    New entries overwrite old on conflict; pre-existing same-day duplicates
+    collapse to the last one."""
+    merged = {_day_key(item[key]): item for item in existing if item.get(key)}
     for item in new:
         if item.get(key):
-            merged[item[key]] = item
+            merged[_day_key(item[key])] = item
     return list(merged.values())
 
 
@@ -137,6 +181,12 @@ def process_ticker(ticker: str, provider_fn, request_pause: float = 0) -> tuple[
         market_data['splits'] = _merge_list(
             existing.get('splits') or [], market_data.get('splits') or [], 'splitDate'
         )
+        # Don't overwrite existing good data with blanks: a throttled/partial provider
+        # response returns '' / None for missing fields (e.g. price, currency,
+        # sharesOutstanding). Drop those so $set only writes real values. Merged
+        # dividends/splits lists and the datetime updatedAt are never '' / None so stay.
+        market_data = {k: v for k, v in market_data.items() if v not in ('', None)}
+        record_shares_history(ticker, market_data.get('sharesOutstanding'))
         operation = UpdateOne(
             {'ticker': ticker},
             {'$set': market_data},
@@ -403,6 +453,7 @@ def update_shares_outstanding():
             if not shares:
                 return 'failed'
             collection.update_one({'ticker': t}, {'$set': {'sharesOutstanding': shares}})
+            record_shares_history(t, shares)
             return 'updated'
         # ticker not in marketData yet — create the full doc, sharesOutstanding included
         result = insert_or_update_market_data(t, auto_fetch_market_data)

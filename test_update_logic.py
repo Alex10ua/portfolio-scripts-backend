@@ -30,6 +30,7 @@ class TestUpdateMarketData(unittest.TestCase):
     def setUp(self):
         updateMarketData.collection.reset_mock(side_effect=True, return_value=True)
         updateMarketData.tickers_collection.reset_mock(side_effect=True, return_value=True)
+        updateMarketData.shares_history_collection.reset_mock(side_effect=True, return_value=True)
         # Reset debounce timers
         updateMarketData.debounce_timers = {"yahoo": None, "massive": None}
 
@@ -134,6 +135,98 @@ class TestUpdateMarketData(unittest.TestCase):
         massive_timer.start.assert_called_once()
         # Yahoo timer was not cancelled (no prior yahoo timer existed)
         yahoo_timer.cancel.assert_not_called()
+
+
+class TestMergeList(unittest.TestCase):
+    """Dedup must be by calendar day: Mongo returns naive datetimes, yfinance
+    yields tz-aware Timestamps, Finnhub/Massive use strings — raw values never
+    compare equal, which used to double every dividend/split on each update."""
+
+    def test_naive_vs_tz_aware_same_day_dedups(self):
+        from datetime import datetime, timezone, timedelta
+        ny = timezone(timedelta(hours=-4))
+        existing = [{'dividendDate': datetime(2024, 3, 14, 4, 0), 'dividendAmount': 0.485}]
+        new = [{'dividendDate': datetime(2024, 3, 14, 0, 0, tzinfo=ny), 'dividendAmount': 0.485}]
+        merged = updateMarketData._merge_list(existing, new, 'dividendDate')
+        self.assertEqual(len(merged), 1)
+        # new entry wins
+        self.assertEqual(merged[0]['dividendDate'].tzinfo, ny)
+
+    def test_string_vs_datetime_same_day_dedups(self):
+        from datetime import datetime
+        existing = [{'dividendDate': datetime(2024, 2, 9), 'dividendAmount': 0.24}]
+        new = [{'dividendDate': '2024-02-09', 'dividendAmount': 0.25}]
+        merged = updateMarketData._merge_list(existing, new, 'dividendDate')
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]['dividendAmount'], 0.25)
+
+    def test_existing_duplicates_collapse(self):
+        from datetime import datetime
+        existing = [
+            {'dividendDate': datetime(2024, 3, 14, 4, 0), 'dividendAmount': 0.485},
+            {'dividendDate': datetime(2024, 3, 14, 4, 0), 'dividendAmount': 0.485},
+        ]
+        merged = updateMarketData._merge_list(existing, [], 'dividendDate')
+        self.assertEqual(len(merged), 1)
+
+    def test_different_days_kept(self):
+        existing = [{'splitDate': '2020-08-31', 'ratioSplit': 4}]
+        new = [{'splitDate': '2024-06-10', 'ratioSplit': 10}]
+        merged = updateMarketData._merge_list(existing, new, 'splitDate')
+        self.assertEqual(len(merged), 2)
+
+    def test_missing_key_skipped(self):
+        merged = updateMarketData._merge_list(
+            [{'dividendAmount': 1}], [{'dividendDate': '2024-01-02', 'dividendAmount': 2}], 'dividendDate')
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]['dividendAmount'], 2)
+
+
+class TestRecordSharesHistory(unittest.TestCase):
+
+    def setUp(self):
+        self.coll = updateMarketData.shares_history_collection
+        self.coll.reset_mock(side_effect=True, return_value=True)
+
+    def test_none_shares_skips(self):
+        updateMarketData.record_shares_history('AAPL', None)
+        self.coll.find_one.assert_not_called()
+        self.coll.update_one.assert_not_called()
+
+    def test_first_entry_appended(self):
+        self.coll.find_one.return_value = None
+        updateMarketData.record_shares_history('AAPL', 1000)
+        args, kwargs = self.coll.update_one.call_args
+        self.assertEqual(args[0], {'_id': 'AAPL'})
+        self.assertEqual(args[1]['$push']['history']['shares'], 1000)
+        self.assertTrue(kwargs.get('upsert'))
+
+    def test_unchanged_value_not_appended(self):
+        self.coll.find_one.return_value = {'history': [{'date': '2026-01-01', 'shares': 1000}]}
+        updateMarketData.record_shares_history('AAPL', 1000)
+        self.coll.update_one.assert_not_called()
+
+    def test_changed_value_appended(self):
+        self.coll.find_one.return_value = {'history': [{'date': '2026-01-01', 'shares': 1000}]}
+        updateMarketData.record_shares_history('AAPL', 900)
+        args, _ = self.coll.update_one.call_args
+        self.assertEqual(args[1]['$push']['history']['shares'], 900)
+
+    def test_same_day_change_replaces_entry(self):
+        from datetime import datetime
+        today = datetime.now().strftime('%Y-%m-%d')
+        self.coll.find_one.return_value = {'history': [{'date': today, 'shares': 1000}]}
+        updateMarketData.record_shares_history('AAPL', 900)
+        calls = self.coll.update_one.call_args_list
+        self.assertEqual(len(calls), 2)
+        # first call pops today's entry, second pushes the corrected value
+        self.assertEqual(calls[0].args[1], {'$pop': {'history': 1}})
+        self.assertEqual(calls[1].args[1]['$push']['history'], {'date': today, 'shares': 900})
+
+    def test_db_error_swallowed(self):
+        self.coll.find_one.side_effect = Exception('mongo down')
+        # must not raise — history is best-effort
+        updateMarketData.record_shares_history('AAPL', 1000)
 
 
 if __name__ == '__main__':
