@@ -353,6 +353,12 @@ def update_yahoo():
 
 @app.route('/update/auto', methods=['POST'])
 def update_auto():
+    # Optional assetType in the body wins over the holdings lookup: on the very
+    # first transaction of a ticker the holding doesn't exist yet, so
+    # is_crypto_ticker() would misroute crypto to Yahoo (blank data).
+    data = request.get_json(silent=True) or {}
+    if str(data.get('assetType') or '').upper() == 'CRYPTO':
+        return _handle_update("auto", crypto_provider.fetch_market_data)
     return _handle_update("auto", auto_fetch_market_data)
 
 
