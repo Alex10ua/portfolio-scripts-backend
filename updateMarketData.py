@@ -13,6 +13,7 @@ import massive_provider
 import finnhub_provider
 import ecb_provider
 import crypto_provider
+import sec_edgar_provider
 
 load_dotenv()
 
@@ -26,6 +27,7 @@ price_history_collection = db['priceHistoryCache']
 custom_assets_collection = db['customAssets']
 holdings_collection = db['holdings']
 shares_history_collection = db['sharesOutstandingHistory']
+fundamentals_collection = db['companyFundamentals']
 
 
 def get_custom_tickers() -> set:
@@ -141,6 +143,34 @@ def record_shares_history(ticker: str, shares) -> None:
         )
     except Exception as e:
         print(f'[sharesHistory] Error recording {ticker}: {e}')
+
+
+def record_shares_history_bulk(ticker: str, entries: list) -> int:
+    """
+    Merge a batch of {date, shares} entries (e.g. from SEC EDGAR) into the
+    ticker's history doc — same collection/shape as record_shares_history, but
+    for a whole time series at once. A later-written entry on an existing date
+    overwrites it. Best-effort: never raises. Returns entries stored (0 on
+    no-op/error) so the caller can report what happened.
+    """
+    if not entries:
+        return 0
+    try:
+        doc = shares_history_collection.find_one({'_id': ticker}, {'history': 1})
+        merged_by_date = {h['date']: h['shares'] for h in (doc or {}).get('history') or [] if h.get('date')}
+        for e in entries:
+            if e.get('date') and e.get('shares') is not None:
+                merged_by_date[e['date']] = int(e['shares'])
+        merged = [{'date': d, 'shares': merged_by_date[d]} for d in sorted(merged_by_date)]
+        shares_history_collection.update_one(
+            {'_id': ticker},
+            {'$set': {'history': merged, 'ticker': ticker, 'lastUpdated': merged[-1]['date']}},
+            upsert=True,
+        )
+        return len(merged)
+    except Exception as e:
+        print(f'[sharesHistory] Error bulk-recording {ticker}: {e}')
+        return 0
 
 
 def _day_key(value) -> str:
@@ -416,6 +446,77 @@ def refresh_price_history(ticker):
     if success:
         return jsonify({'status': 'ok', 'ticker': ticker}), 200
     return jsonify({'status': 'error', 'ticker': ticker}), 500
+
+
+@app.route('/update/sharesOutstandingHistory', methods=['POST'])
+def update_shares_outstanding_history():
+    """
+    Backfill historical sharesOutstanding for one ticker from SEC EDGAR XBRL
+    filings (US-registered companies only — no data for foreign private
+    issuers, ADRs without SEC registration, or crypto). Body: {"ticker": "MSFT"}.
+    Merges into sharesOutstandingHistory; does NOT touch the live
+    marketData.sharesOutstanding field (SEC filings lag the current
+    yfinance-sourced value, so overwriting it would make it staler, not fresher).
+    """
+    data = request.get_json(silent=True) or {}
+    ticker = (data.get('ticker') or '').strip().upper()
+    if not ticker:
+        return jsonify({'status': 'error', 'error': 'ticker is required'}), 400
+    if ticker in get_custom_tickers():
+        return jsonify({'status': 'error', 'error': f'{ticker} is a custom asset, not a market ticker'}), 400
+
+    try:
+        entries = sec_edgar_provider.fetch_shares_history(ticker)
+    except Exception as e:
+        return jsonify({'status': 'error', 'ticker': ticker, 'error': str(e)}), 502
+
+    if not entries:
+        cik = sec_edgar_provider.get_cik(ticker)
+        reason = 'no CIK found for ticker (not SEC-registered?)' if not cik else 'no shares-outstanding filings found'
+        return jsonify({'status': 'no_data', 'ticker': ticker, 'reason': reason}), 200
+
+    written = record_shares_history_bulk(ticker, entries)
+    return jsonify({
+        'status': 'success',
+        'ticker': ticker,
+        'entriesFound': len(entries),
+        'entriesStored': written,
+    }), 200
+
+
+@app.route('/update/fundamentals', methods=['POST'])
+def update_fundamentals():
+    """
+    Backfill fundamentals (assets, liabilities, equity, revenue, net/operating
+    income, diluted EPS, cash, long-term debt, R&D spend, buyback spend,
+    dividend/share) for one US-listed ticker from SEC EDGAR XBRL filings.
+    Body: {"ticker": "MSFT"}. Whole-doc replace in companyFundamentals — a
+    concept the company stopped/started reporting is reflected exactly as SEC
+    has it on each refresh, not merged with a possibly-stale prior fetch.
+    """
+    data = request.get_json(silent=True) or {}
+    ticker = (data.get('ticker') or '').strip().upper()
+    if not ticker:
+        return jsonify({'status': 'error', 'error': 'ticker is required'}), 400
+    if ticker in get_custom_tickers():
+        return jsonify({'status': 'error', 'error': f'{ticker} is a custom asset, not a market ticker'}), 400
+
+    try:
+        concepts = sec_edgar_provider.fetch_fundamentals(ticker)
+    except Exception as e:
+        return jsonify({'status': 'error', 'ticker': ticker, 'error': str(e)}), 502
+
+    if not concepts:
+        cik = sec_edgar_provider.get_cik(ticker)
+        reason = 'no CIK found for ticker (not SEC-registered?)' if not cik else 'no fundamentals concepts found'
+        return jsonify({'status': 'no_data', 'ticker': ticker, 'reason': reason}), 200
+
+    fundamentals_collection.update_one(
+        {'_id': ticker},
+        {'$set': {'ticker': ticker, 'concepts': concepts, 'updatedAt': datetime.now()}},
+        upsert=True,
+    )
+    return jsonify({'status': 'success', 'ticker': ticker, 'concepts': list(concepts.keys())}), 200
 
 
 def fetch_shares_outstanding(ticker: str):
@@ -719,6 +820,38 @@ OPENAPI_SPEC = {
                 'requestBody': TICKER_BODY,
                 'responses': {'200': {'description': '{requested, updated, created[], failed[]}'},
                               '500': {'description': 'DB error'}},
+            },
+        },
+        '/update/fundamentals': {
+            'post': {
+                'summary': 'Backfill fundamentals (assets/liabilities/equity/revenue/income/EPS/cash/debt/R&D/buybacks/dividend-per-share) for one US-listed ticker from SEC EDGAR',
+                'requestBody': {
+                    'required': True,
+                    'content': {'application/json': {'schema': {
+                        'type': 'object',
+                        'required': ['ticker'],
+                        'properties': {'ticker': {'type': 'string', 'example': 'MSFT'}},
+                    }}},
+                },
+                'responses': {'200': {'description': '{status, ticker, concepts: [keys]} or {status: "no_data", reason}'},
+                              '400': {'description': 'ticker missing or is a custom asset'},
+                              '502': {'description': 'SEC EDGAR request failed'}},
+            },
+        },
+        '/update/sharesOutstandingHistory': {
+            'post': {
+                'summary': 'Backfill historical sharesOutstanding for one US-listed ticker from SEC EDGAR XBRL filings (does not touch the live marketData value)',
+                'requestBody': {
+                    'required': True,
+                    'content': {'application/json': {'schema': {
+                        'type': 'object',
+                        'required': ['ticker'],
+                        'properties': {'ticker': {'type': 'string', 'example': 'MSFT'}},
+                    }}},
+                },
+                'responses': {'200': {'description': '{status, ticker, entriesFound, entriesStored} or {status: "no_data", reason}'},
+                              '400': {'description': 'ticker missing or is a custom asset'},
+                              '502': {'description': 'SEC EDGAR request failed'}},
             },
         },
         '/update/throttled': {
