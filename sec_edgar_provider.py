@@ -3,8 +3,17 @@ SEC EDGAR XBRL provider — historical data backfill for US-listed tickers.
 Free, no API key. SEC requires a descriptive User-Agent identifying the app +
 contact (https://www.sec.gov/os/webmaster-faq#developers) — requests without
 one get 403'd.
+
+Every request goes through _sec_get(), which enforces a process-wide rate limit
+(SEC's fair-access policy caps clients at 10 requests/second and blocks IPs that
+sustain more). One ticker's fundamentals alone costs ~14 requests, so a bulk run
+would blow that limit in the first second without this gate. The default here is
+much slower than SEC allows — see SECONDS_PER_REQUEST.
 """
 import os
+import threading
+import time
+
 import requests
 
 TICKER_MAP_URL = 'https://www.sec.gov/files/company_tickers.json'
@@ -12,6 +21,54 @@ CONCEPT_URL = 'https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/{taxonomy}/
 
 USER_AGENT = os.getenv('SEC_USER_AGENT', 'FinancePortfolio admin@financeportfolio.local')
 _HEADERS = {'User-Agent': USER_AGENT}
+
+# Seconds to wait between SEC requests. Default 5 s (0.2 req/s) — far below SEC's
+# documented 10 req/s ceiling, which is where blocking starts rather than a target.
+# The cost is real: one ticker's fundamentals is ~15 requests, so ~75 s per ticker.
+# Override with SEC_SECONDS_PER_REQUEST; 0 disables throttling entirely.
+SECONDS_PER_REQUEST = float(os.getenv('SEC_SECONDS_PER_REQUEST', '5'))
+_MIN_INTERVAL = max(0.0, SECONDS_PER_REQUEST)
+MAX_REQUESTS_PER_SEC = 1.0 / _MIN_INTERVAL if _MIN_INTERVAL > 0 else 0.0
+
+_rate_lock = threading.Lock()
+_last_request_at = 0.0
+
+
+class SecThrottled(RuntimeError):
+    """
+    SEC answered 403/429 — the client is being rate-limited or blocked.
+    Callers running in bulk must ABORT rather than continue: hammering through a
+    403 is what turns a temporary throttle into a longer IP block.
+    """
+
+
+def _throttle() -> None:
+    """
+    Space out SEC requests process-wide. The sleep happens while holding the
+    lock on purpose: concurrent threads must queue behind each other, otherwise
+    N workers each honour the interval individually and the real rate is N×.
+    """
+    global _last_request_at
+    if _MIN_INTERVAL <= 0:
+        return
+    with _rate_lock:
+        wait = _last_request_at + _MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_at = time.monotonic()
+
+
+def _sec_get(url: str) -> requests.Response:
+    """Rate-limited GET against SEC. Raises SecThrottled on 403/429."""
+    _throttle()
+    response = requests.get(url, headers=_HEADERS, timeout=15)
+    if response.status_code in (403, 429):
+        raise SecThrottled(
+            f'SEC returned {response.status_code} for {url} — rate limited or blocked. '
+            f'Raise SEC_SECONDS_PER_REQUEST (currently {SECONDS_PER_REQUEST}s between requests) '
+            f'and check SEC_USER_AGENT identifies the app with a contact address.'
+        )
+    return response
 
 # Reporting concepts that carry share counts, tried in order — companies vary
 # which one they tag consistently across filings.
@@ -50,7 +107,7 @@ def _load_cik_map() -> dict:
     global _cik_map_cache
     if _cik_map_cache is not None:
         return _cik_map_cache
-    response = requests.get(TICKER_MAP_URL, headers=_HEADERS, timeout=15)
+    response = _sec_get(TICKER_MAP_URL)
     response.raise_for_status()
     data = response.json()  # {"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}, ...}
     _cik_map_cache = {
@@ -72,7 +129,7 @@ def _fetch_concept_series(cik: str, taxonomy: str, tag: str) -> list[dict] | Non
     empty list, so callers can fall through to the next tag candidate.
     """
     url = CONCEPT_URL.format(cik=cik, taxonomy=taxonomy, tag=tag)
-    response = requests.get(url, headers=_HEADERS, timeout=15)
+    response = _sec_get(url)
     if response.status_code == 404:
         return None
     response.raise_for_status()

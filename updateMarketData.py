@@ -57,6 +57,22 @@ throttled_status = {
     "finishedAt": None,
 }
 
+# Bulk SEC EDGAR backfill — one run at a time (see run_sec_bulk_task)
+sec_bulk_lock = threading.Lock()
+sec_bulk_status = {
+    "running": False,
+    "total": 0,
+    "processed": 0,
+    "fundamentalsUpdated": 0,
+    "sharesUpdated": 0,
+    "noData": [],
+    "failed": [],
+    "currentTicker": None,
+    "abortedReason": None,
+    "startedAt": None,
+    "finishedAt": None,
+}
+
 app = Flask(__name__)
 
 
@@ -105,6 +121,9 @@ def yahoo_fetch_market_data(ticker: str, request_pause: float = 0) -> dict:
         'sector': updateMarketDataUtilities.get_sector(info, ticker),
         'industry': updateMarketDataUtilities.get_industry(info, ticker),
         'sharesOutstanding': get_shares_with_fallback(ticker, info),
+        # full key-statistics snapshot (margins, valuation, balance sheet, ...);
+        # None when .info carried none of them, so it gets dropped, not written blank
+        'statistics': updateMarketDataUtilities.get_statistics(info, ticker),
         'updatedAt': datetime.now(),
     }
     # price history can only reuse this download when the history symbol matches
@@ -467,6 +486,8 @@ def update_shares_outstanding_history():
 
     try:
         entries = sec_edgar_provider.fetch_shares_history(ticker)
+    except sec_edgar_provider.SecThrottled as e:
+        return jsonify({'status': 'rate_limited', 'ticker': ticker, 'error': str(e)}), 429
     except Exception as e:
         return jsonify({'status': 'error', 'ticker': ticker, 'error': str(e)}), 502
 
@@ -503,6 +524,8 @@ def update_fundamentals():
 
     try:
         concepts = sec_edgar_provider.fetch_fundamentals(ticker)
+    except sec_edgar_provider.SecThrottled as e:
+        return jsonify({'status': 'rate_limited', 'ticker': ticker, 'error': str(e)}), 429
     except Exception as e:
         return jsonify({'status': 'error', 'ticker': ticker, 'error': str(e)}), 502
 
@@ -517,6 +540,195 @@ def update_fundamentals():
         upsert=True,
     )
     return jsonify({'status': 'success', 'ticker': ticker, 'concepts': list(concepts.keys())}), 200
+
+
+@app.route('/update/statistics', methods=['POST'])
+def update_statistics():
+    """
+    Refresh only marketData.statistics for one ticker. Body: {"ticker": "MSFT"}.
+    One Yahoo request (.info) — no history download — so it's the cheap path for
+    an on-demand refresh from the Statistics page. sharesOutstanding (and its
+    history) rides along since .info already carries it.
+    """
+    data = request.get_json(silent=True) or {}
+    ticker = (data.get('ticker') or '').strip()
+    if not ticker:
+        return jsonify({'status': 'error', 'error': 'ticker is required'}), 400
+    if ticker in get_custom_tickers():
+        return jsonify({'status': 'skipped', 'reason': 'custom asset ticker', 'ticker': ticker}), 200
+
+    try:
+        info = yf.Ticker(yahoo_crypto_symbol(ticker)).info
+        stats = updateMarketDataUtilities.get_statistics(info, ticker)
+    except Exception as e:
+        print(f'[statistics] Error fetching {ticker}: {e}')
+        return jsonify({'status': 'error', 'ticker': ticker, 'error': str(e)}), 502
+
+    if not stats:
+        return jsonify({'status': 'no_data', 'ticker': ticker,
+                        'reason': 'provider returned no statistics fields'}), 200
+
+    update = {'statistics': stats, 'ticker': ticker, 'updatedAt': datetime.now()}
+    shares = get_shares_with_fallback(ticker, info)
+    if shares:
+        update['sharesOutstanding'] = shares
+        record_shares_history(ticker, shares)
+    collection.update_one({'ticker': ticker}, {'$set': update}, upsert=True)
+    return jsonify({'status': 'success', 'ticker': ticker, 'fields': len(stats)}), 200
+
+
+def sec_update_one(ticker: str) -> dict:
+    """
+    Fundamentals + shares-outstanding history for one ticker from SEC EDGAR.
+    Returns {'fundamentals': bool, 'shares': int} — False/0 simply means the
+    filer never tagged that data (or has no CIK), which is not an error.
+    Lets SecThrottled propagate: the caller must stop the whole run.
+    """
+    concepts = sec_edgar_provider.fetch_fundamentals(ticker)
+    if concepts:
+        fundamentals_collection.update_one(
+            {'_id': ticker},
+            {'$set': {'ticker': ticker, 'concepts': concepts, 'updatedAt': datetime.now()}},
+            upsert=True,
+        )
+    entries = sec_edgar_provider.fetch_shares_history(ticker)
+    stored = record_shares_history_bulk(ticker, entries) if entries else 0
+    return {'fundamentals': bool(concepts), 'shares': stored}
+
+
+def run_sec_bulk_task(tickers: list[str], pause_seconds: float):
+    """
+    Sequential SEC EDGAR backfill over many tickers. Deliberately serial: one
+    ticker costs ~15 SEC requests (14 fundamentals concepts + shares history),
+    each spaced by sec_edgar_provider.SECONDS_PER_REQUEST (default 5 s, so ~75 s
+    per ticker). pause_seconds adds slack between tickers on top of that. A full
+    portfolio run takes tens of minutes by design — SEC access is the scarce
+    resource here, not wall-clock time.
+
+    A SecThrottled (403/429) aborts the whole run instead of retrying — pushing
+    through SEC's throttle is what escalates it to an IP block. Everything
+    already written stays; re-run later to continue.
+    """
+    try:
+        with sec_bulk_lock:
+            sec_bulk_status.update({
+                "total": len(tickers), "processed": 0, "fundamentalsUpdated": 0,
+                "sharesUpdated": 0, "noData": [], "failed": [], "currentTicker": None,
+                "abortedReason": None, "startedAt": datetime.now().isoformat(), "finishedAt": None,
+            })
+
+        print(f"[{datetime.now()}] [sec-bulk] Starting SEC backfill of {len(tickers)} tickers "
+              f"({sec_edgar_provider.SECONDS_PER_REQUEST}s between SEC requests, "
+              f"{pause_seconds}s between tickers)...")
+
+        for i, ticker in enumerate(tickers, 1):
+            if i > 1 and pause_seconds > 0:
+                time.sleep(pause_seconds)
+            with sec_bulk_lock:
+                sec_bulk_status["currentTicker"] = ticker
+
+            try:
+                result = sec_update_one(ticker)
+            except sec_edgar_provider.SecThrottled as e:
+                print(f"[sec-bulk] ABORTED at {ticker}: {e}")
+                with sec_bulk_lock:
+                    sec_bulk_status["abortedReason"] = str(e)
+                return
+            except Exception as e:
+                print(f"[sec-bulk] [{i}/{len(tickers)}] {ticker} failed: {e}")
+                with sec_bulk_lock:
+                    sec_bulk_status["failed"].append(ticker)
+                    sec_bulk_status["processed"] = i
+                continue
+
+            with sec_bulk_lock:
+                if result['fundamentals']:
+                    sec_bulk_status["fundamentalsUpdated"] += 1
+                if result['shares']:
+                    sec_bulk_status["sharesUpdated"] += 1
+                if not result['fundamentals'] and not result['shares']:
+                    sec_bulk_status["noData"].append(ticker)
+                sec_bulk_status["processed"] = i
+
+            print(f"[sec-bulk] [{i}/{len(tickers)}] {ticker}: "
+                  f"fundamentals={'yes' if result['fundamentals'] else 'no'} "
+                  f"sharesPoints={result['shares']}")
+
+        print(f"[{datetime.now()}] [sec-bulk] Task finished.")
+    finally:
+        with sec_bulk_lock:
+            sec_bulk_status["running"] = False
+            sec_bulk_status["currentTicker"] = None
+            sec_bulk_status["finishedAt"] = datetime.now().isoformat()
+
+
+@app.route('/update/sec/all', methods=['POST'])
+def update_sec_all():
+    """
+    Background SEC EDGAR backfill (fundamentals + shares-outstanding history)
+    for every ticker in marketData, or an explicit {"tickers": [...]} subset.
+    Body: {"pauseSeconds": 1, "tickers": [...]}.
+    Returns immediately; poll GET /update/sec/all/status.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        pause_seconds = float(data.get('pauseSeconds', 1))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "error": "pauseSeconds must be a number"}), 400
+    if pause_seconds < 0:
+        return jsonify({"status": "error", "error": "pauseSeconds must be >= 0"}), 400
+
+    requested = data.get('tickers')
+    if requested is not None and not isinstance(requested, list):
+        return jsonify({"status": "error", "error": "tickers must be a list"}), 400
+
+    if requested:
+        tickers = [str(t).strip().upper() for t in requested if str(t).strip()]
+    else:
+        tickers = sorted(set(
+            doc['ticker'] for doc in collection.find({}, {'ticker': 1}) if doc.get('ticker')
+        ))
+
+    # Custom assets hold user-set data and their names can collide with real
+    # exchange tickers — they must never hit a provider.
+    custom_tickers = get_custom_tickers()
+    skipped_custom = [t for t in tickers if t in custom_tickers]
+    tickers = [t for t in tickers if t not in custom_tickers]
+
+    if not tickers:
+        return jsonify({"status": "error", "error": "no tickers to process",
+                        "skippedCustom": skipped_custom}), 400
+
+    with sec_bulk_lock:
+        if sec_bulk_status["running"]:
+            return jsonify({
+                "status": "already_running",
+                "processed": sec_bulk_status["processed"],
+                "total": sec_bulk_status["total"],
+                "currentTicker": sec_bulk_status["currentTicker"],
+            }), 409
+        sec_bulk_status["running"] = True
+
+    threading.Thread(target=run_sec_bulk_task, args=[tickers, pause_seconds], daemon=True).start()
+
+    # ~15 SEC requests per ticker at the configured spacing, plus the inter-ticker pause
+    spacing = sec_edgar_provider.SECONDS_PER_REQUEST
+    estimate_seconds = int(len(tickers) * (15 * spacing + pause_seconds))
+    return jsonify({
+        "status": "started",
+        "tickers": len(tickers),
+        "skippedCustom": skipped_custom,
+        "secondsPerRequest": spacing,
+        "pauseSeconds": pause_seconds,
+        "estimatedSeconds": estimate_seconds,
+        "estimatedMinutes": round(estimate_seconds / 60, 1),
+    }), 202
+
+
+@app.route('/update/sec/all/status', methods=['GET'])
+def update_sec_all_status():
+    with sec_bulk_lock:
+        return jsonify(dict(sec_bulk_status)), 200
 
 
 def fetch_shares_outstanding(ticker: str):
@@ -835,7 +1047,24 @@ OPENAPI_SPEC = {
                 },
                 'responses': {'200': {'description': '{status, ticker, concepts: [keys]} or {status: "no_data", reason}'},
                               '400': {'description': 'ticker missing or is a custom asset'},
+                              '429': {'description': 'SEC rate-limited/blocked this client (403/429) — back off, do not retry immediately'},
                               '502': {'description': 'SEC EDGAR request failed'}},
+            },
+        },
+        '/update/statistics': {
+            'post': {
+                'summary': 'Refresh marketData.statistics (key statistics: margins, valuation, balance sheet, dividends, analyst view) for one ticker — one Yahoo .info request, no history download',
+                'requestBody': {
+                    'required': True,
+                    'content': {'application/json': {'schema': {
+                        'type': 'object',
+                        'required': ['ticker'],
+                        'properties': {'ticker': {'type': 'string', 'example': 'MSFT'}},
+                    }}},
+                },
+                'responses': {'200': {'description': '{status, ticker, fields} or {status: "no_data"|"skipped", reason}'},
+                              '400': {'description': 'ticker required'},
+                              '502': {'description': 'Yahoo request failed'}},
             },
         },
         '/update/sharesOutstandingHistory': {
@@ -851,7 +1080,48 @@ OPENAPI_SPEC = {
                 },
                 'responses': {'200': {'description': '{status, ticker, entriesFound, entriesStored} or {status: "no_data", reason}'},
                               '400': {'description': 'ticker missing or is a custom asset'},
+                              '429': {'description': 'SEC rate-limited/blocked this client (403/429) — back off, do not retry immediately'},
                               '502': {'description': 'SEC EDGAR request failed'}},
+            },
+        },
+        '/update/sec/all': {
+            'post': {
+                'summary': 'Bulk SEC EDGAR backfill (fundamentals + shares-outstanding history) for every marketData ticker, or a given subset',
+                'description': (
+                    'Runs in the background, one ticker at a time. Each ticker costs ~15 SEC requests '
+                    '(14 fundamentals concepts + shares history), and every SEC request is spaced '
+                    'process-wide by SEC_SECONDS_PER_REQUEST — default 5 s, i.e. ~75 s per ticker, so a '
+                    'whole portfolio takes tens of minutes. That is well under SEC\'s 10 req/s fair-access '
+                    'ceiling on purpose. pauseSeconds adds slack between tickers on top. '
+                    'A 403/429 from SEC aborts the run (abortedReason in status) rather than retrying, '
+                    'because pushing through a throttle escalates it to an IP block. '
+                    'Custom-asset tickers are skipped; non-SEC-registered tickers (foreign issuers, crypto) '
+                    'land in noData, which is not an error. Poll GET /update/sec/all/status for progress.'
+                ),
+                'requestBody': {
+                    'required': False,
+                    'content': {'application/json': {'schema': {
+                        'type': 'object',
+                        'properties': {
+                            'pauseSeconds': {'type': 'number', 'example': 1,
+                                             'description': 'Extra pause between tickers (default 1)'},
+                            'tickers': {'type': 'array', 'items': {'type': 'string'},
+                                        'example': ['MSFT', 'KO'],
+                                        'description': 'Subset to process; omit for every marketData ticker'},
+                        },
+                    }}},
+                },
+                'responses': {
+                    '202': {'description': '{status: "started", tickers, skippedCustom[], secondsPerRequest, pauseSeconds, estimatedSeconds, estimatedMinutes}'},
+                    '400': {'description': 'Invalid pauseSeconds/tickers, or nothing to process'},
+                    '409': {'description': 'A SEC bulk run is already in progress'},
+                },
+            },
+        },
+        '/update/sec/all/status': {
+            'get': {
+                'summary': 'Progress of the current/last SEC bulk backfill',
+                'responses': {'200': {'description': '{running, total, processed, fundamentalsUpdated, sharesUpdated, noData[], failed[], currentTicker, abortedReason, startedAt, finishedAt}'}},
             },
         },
         '/update/throttled': {
