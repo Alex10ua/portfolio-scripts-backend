@@ -13,6 +13,7 @@ much slower than SEC allows — see SECONDS_PER_REQUEST.
 import os
 import threading
 import time
+from datetime import datetime, timedelta
 
 import requests
 
@@ -70,12 +71,32 @@ def _sec_get(url: str) -> requests.Response:
         )
     return response
 
-# Reporting concepts that carry share counts, tried in order — companies vary
-# which one they tag consistently across filings.
+# Point-in-time share counts, best first. Both are as-of-date facts, so they are
+# the honest answer to "how many shares existed then".
 _SHARES_CONCEPTS = [
     ('us-gaap', 'CommonStockSharesOutstanding'),
     ('dei', 'EntityCommonStockSharesOutstanding'),
 ]
+
+# Used only when the concepts above come back sparse or stale. A multi-class
+# filer (e.g. MA, GOOG, BRK) tags its cover-page and balance-sheet share counts
+# PER SHARE CLASS — dimensioned facts, which the companyconcept API does not
+# return — so the un-dimensioned series dries up the year the second class
+# appears. MA: us-gaap 404s outright, dei stops after 2010-10-27, 4 facts total.
+# Weighted-average basic shares stay un-dimensioned (EPS is computed on the
+# combined classes) and are filed every quarter — 74 periods for MA, 2007→2026.
+# It is an average over the period, not an as-of count, so it lands within a
+# fraction of a percent of the true figure but is not exact; point-in-time
+# concepts always win a date conflict.
+_SHARES_FALLBACK_CONCEPTS = [
+    ('us-gaap', 'CommonStockSharesIssued'),
+    ('us-gaap', 'WeightedAverageNumberOfSharesOutstandingBasic'),
+]
+
+# Below this many point-in-time facts the series is treated as unusable and the
+# fallback concepts are fetched too (2 extra SEC requests for that ticker).
+_SHARES_SPARSE_BELOW = 8
+_SHARES_STALE_DAYS = 730
 
 # Curated fundamentals: one internal key -> ordered list of (taxonomy, tag)
 # candidates, since filers drift which exact tag they use across years (e.g.
@@ -121,12 +142,29 @@ def get_cik(ticker: str) -> str | None:
     return _load_cik_map().get(ticker.upper())
 
 
-def _fetch_concept_series(cik: str, taxonomy: str, tag: str) -> list[dict] | None:
+def _period_days(entry: dict) -> int:
+    """Length of a duration fact in days; 0 for an instant fact (no 'start')."""
+    start, end = entry.get('start'), entry.get('end')
+    if not start or not end:
+        return 0
+    try:
+        return (datetime.strptime(end, '%Y-%m-%d') - datetime.strptime(start, '%Y-%m-%d')).days
+    except ValueError:
+        return 0
+
+
+def _fetch_concept_series(cik: str, taxonomy: str, tag: str, prefer_shortest_period: bool = False) -> list[dict] | None:
     """
     Single XBRL concept's full filing history for a CIK, deduped by as-of date
     (a later filing for the same date wins — amendments/restatements). Returns
     None when the company never tagged this concept (404) — distinct from an
     empty list, so callers can fall through to the next tag candidate.
+
+    `prefer_shortest_period` matters for duration facts, where one 'end' carries
+    both a quarterly and an annual value (Q4 and FY share 12-31). Deduping on
+    the date alone then picks whichever was filed later — an annual figure
+    landing in an otherwise quarterly series. On it wins the shortest period, so
+    the series stays one consistent cadence.
     """
     url = CONCEPT_URL.format(cik=cik, taxonomy=taxonomy, tag=tag)
     response = _sec_get(url)
@@ -136,7 +174,7 @@ def _fetch_concept_series(cik: str, taxonomy: str, tag: str) -> list[dict] | Non
     payload = response.json()
 
     by_date: dict[str, dict] = {}
-    filed_by_date: dict[str, str] = {}
+    rank_by_date: dict[str, tuple] = {}
     for unit_entries in payload.get('units', {}).values():
         for entry in unit_entries:
             end_date = entry.get('end')
@@ -144,11 +182,21 @@ def _fetch_concept_series(cik: str, taxonomy: str, tag: str) -> list[dict] | Non
             filed = entry.get('filed', '')
             if not end_date or val is None:
                 continue
-            if end_date not in filed_by_date or filed >= filed_by_date[end_date]:
+            # sort key, highest wins: shorter period first when asked, then later filing
+            rank = (-_period_days(entry), filed) if prefer_shortest_period else (0, filed)
+            if end_date not in rank_by_date or rank >= rank_by_date[end_date]:
                 by_date[end_date] = {'date': end_date, 'value': val, 'form': entry.get('form', ''), 'filed': filed}
-                filed_by_date[end_date] = filed
+                rank_by_date[end_date] = rank
 
     return [by_date[d] for d in sorted(by_date)]
+
+
+def _is_sparse(by_date: dict) -> bool:
+    """True when a share series is too short or too old to stand on its own."""
+    if len(by_date) < _SHARES_SPARSE_BELOW:
+        return True
+    newest = max(by_date)
+    return newest < (datetime.now() - timedelta(days=_SHARES_STALE_DAYS)).strftime('%Y-%m-%d')
 
 
 def fetch_shares_history(ticker: str) -> list[dict]:
@@ -156,17 +204,33 @@ def fetch_shares_history(ticker: str) -> list[dict]:
     Returns [{'date': 'YYYY-MM-DD', 'shares': int}, ...] sorted ascending,
     sourced from SEC XBRL company filings. Empty list when the ticker has no
     CIK (not SEC-registered — foreign issuer, crypto, etc.) or no filings under
-    either concept. Raises only on network/HTTP failure, never on "no data".
+    any concept. Raises only on network/HTTP failure, never on "no data".
+
+    Concepts are MERGED, not first-match: filers drift between tags over the
+    years, so each covers a different slice of the history and stopping at the
+    first non-empty one truncates the series to whichever was tried first.
+    Earlier concepts win a date conflict, so the sparse fallbacks can only add
+    dates the point-in-time concepts never covered.
     """
     cik = get_cik(ticker)
     if not cik:
         return []
 
-    for taxonomy, tag in _SHARES_CONCEPTS:
-        series = _fetch_concept_series(cik, taxonomy, tag)
-        if series:
-            return [{'date': e['date'], 'shares': int(e['value'])} for e in series]
-    return []
+    by_date: dict[str, int] = {}
+
+    def absorb(concepts):
+        for taxonomy, tag in concepts:
+            series = _fetch_concept_series(cik, taxonomy, tag, prefer_shortest_period=True)
+            for entry in series or []:
+                by_date.setdefault(entry['date'], int(entry['value']))
+
+    absorb(_SHARES_CONCEPTS)
+    # 2 extra SEC requests, so only for filers whose un-dimensioned series is
+    # unusable — the multi-share-class case (see _SHARES_FALLBACK_CONCEPTS)
+    if _is_sparse(by_date):
+        absorb(_SHARES_FALLBACK_CONCEPTS)
+
+    return [{'date': d, 'shares': by_date[d]} for d in sorted(by_date)]
 
 
 def fetch_fundamentals(ticker: str) -> dict:

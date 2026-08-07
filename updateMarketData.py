@@ -53,6 +53,10 @@ throttled_status = {
     "processed": 0,
     "updated": 0,
     "failed": [],
+    # Cooperative stop: the worker thread checks this between tickers. Killing a
+    # thread mid-write is not an option, so a cancel finishes the ticker in flight.
+    "cancelRequested": False,
+    "abortedReason": None,
     "startedAt": None,
     "finishedAt": None,
 }
@@ -68,12 +72,83 @@ sec_bulk_status = {
     "noData": [],
     "failed": [],
     "currentTicker": None,
+    "cancelRequested": False,
     "abortedReason": None,
     "startedAt": None,
     "finishedAt": None,
 }
 
+
+def _cancelled(lock, status) -> bool:
+    with lock:
+        return bool(status["cancelRequested"])
+
+
+def _sleep_unless_cancelled(seconds: float, lock, status) -> bool:
+    """
+    Sleep in ≤1 s slices, bailing out as soon as a cancel lands. Without this a
+    stop would sit through the whole inter-ticker pause (15 s by default) before
+    taking effect. Returns False when cancelled.
+    """
+    remaining = seconds
+    while remaining > 0:
+        if _cancelled(lock, status):
+            return False
+        step = min(1.0, remaining)
+        time.sleep(step)
+        remaining -= step
+    return not _cancelled(lock, status)
+
 app = Flask(__name__)
+
+# yfinance looks up an exchange's timezone before every history download and caches
+# it in an sqlite file. Left at its default the cache lives inside the container, so
+# a recreate makes every ticker pay that extra chart request again — measured 2
+# requests per history(period='max') cold vs 1 warm. Point it at a volume.
+YF_CACHE_DIR = os.getenv('YF_CACHE_DIR')
+if YF_CACHE_DIR:
+    try:
+        os.makedirs(YF_CACHE_DIR, exist_ok=True)
+        yf.set_tz_cache_location(YF_CACHE_DIR)
+    except Exception as e:  # read-only FS, bad path — the default location still works
+        print(f'[yfinance] tz cache location {YF_CACHE_DIR} unusable: {e}')
+
+# One .info costs 3 Yahoo requests (quoteSummary + quote + timeseries), and several
+# endpoints want the same payload for the same ticker back to back (statistics, then
+# sharesOutstanding). Short TTL so an explicit "refresh" still sees fresh data.
+YF_INFO_CACHE_TTL = float(os.getenv('YF_INFO_CACHE_TTL', '300'))
+_info_cache: dict[str, tuple[float, dict]] = {}
+_info_cache_lock = threading.Lock()
+
+
+def ticker_info(symbol: str, stock=None) -> dict:
+    """Yahoo .info for a symbol, reused within YF_INFO_CACHE_TTL seconds (0 disables)."""
+    if YF_INFO_CACHE_TTL > 0:
+        with _info_cache_lock:
+            entry = _info_cache.get(symbol)
+            if entry and (time.monotonic() - entry[0]) < YF_INFO_CACHE_TTL:
+                return entry[1]
+    info = (stock or yf.Ticker(symbol)).info
+    if YF_INFO_CACHE_TTL > 0 and info:
+        with _info_cache_lock:
+            _info_cache[symbol] = (time.monotonic(), info)
+    return info
+
+
+def actions_series(hist, column: str):
+    """
+    Non-zero Dividends / Stock Splits column of a history frame. history() already
+    returns both columns, while Ticker.dividends/.splits re-request the chart with
+    different params and so miss yfinance's cache — same data, one wasted request.
+    """
+    try:
+        if hist is None or column not in hist.columns:
+            return {}  # empty mapping — get_dividends/get_splits just yield nothing
+        series = hist[column]
+        return series[series != 0]
+    except Exception as e:
+        print(f'[actions] Error reading {column}: {e}')
+        return {}
 
 
 def get_shares_with_fallback(ticker: str, info: dict):
@@ -87,7 +162,7 @@ def get_shares_with_fallback(ticker: str, info: dict):
     if shares is None and ticker.upper().endswith('.IL'):
         sibling = ticker[:-3] + '.L'
         try:
-            shares = updateMarketDataUtilities.get_shares_outstanding(yf.Ticker(sibling).info, sibling)
+            shares = updateMarketDataUtilities.get_shares_outstanding(ticker_info(sibling), sibling)
             if shares:
                 print(f'[sharesOutstanding] {ticker}: filled from {sibling} = {shares}')
         except Exception as e:
@@ -97,17 +172,24 @@ def get_shares_with_fallback(ticker: str, info: dict):
 
 def yahoo_fetch_market_data(ticker: str, request_pause: float = 0) -> dict:
     """
-    Fetch full market data from Yahoo Finance in two requests: .info (quoteSummary)
-    and one history(period='max') download that serves dividends, splits AND the
-    daily price history. The history DataFrame rides along under '_history'
-    (popped by process_ticker before the DB write, reused by get_price_history).
-    request_pause sleeps between the two requests.
+    Fetch full market data from Yahoo Finance in two calls: .info (quoteSummary,
+    3 HTTP requests) and one history(period='max') download (1-2, depending on the
+    tz cache) that serves dividends, splits AND the daily price history. The history
+    DataFrame rides along under '_history' (popped by process_ticker before the DB
+    write, reused by get_price_history). request_pause sleeps between the two.
+
+    Dividends/splits are read off that frame rather than via stock.dividends /
+    stock.splits — the properties re-request the chart with different params, so
+    they miss yfinance's cache and cost an extra request for identical data.
     """
-    stock = yf.Ticker(ticker)
-    info = stock.info
+    # Crypto is quoted as a pair on Yahoo ('BTC' -> 'BTC-USD'). Fetching the raw
+    # symbol returned nothing and get_price_history then re-fetched the mapped one.
+    symbol = yahoo_crypto_symbol(ticker)
+    stock = yf.Ticker(symbol)
+    info = ticker_info(symbol, stock)
     if request_pause > 0:
         time.sleep(request_pause)
-    hist = stock.history(period='max')  # .dividends/.splits below reuse this download
+    hist = stock.history(period='max')
     data = {
         'name': updateMarketDataUtilities.get_company_name(info, ticker),
         'price': updateMarketDataUtilities.get_current_price(info, ticker),
@@ -115,8 +197,8 @@ def yahoo_fetch_market_data(ticker: str, request_pause: float = 0) -> dict:
         'priceYesterday': updateMarketDataUtilities.get_close_price(info, ticker),
         'yearlyDividend': updateMarketDataUtilities.get_yearly_dividend(info, ticker),
         'lastDividendPayment': updateMarketDataUtilities.get_last_dividend_payment(info, ticker),
-        'dividends': updateMarketDataUtilities.get_dividends(stock.dividends, ticker),
-        'splits': updateMarketDataUtilities.get_splits(stock.splits, ticker),
+        'dividends': updateMarketDataUtilities.get_dividends(actions_series(hist, 'Dividends'), ticker),
+        'splits': updateMarketDataUtilities.get_splits(actions_series(hist, 'Stock Splits'), ticker),
         'country': updateMarketDataUtilities.get_stock_country(info, ticker),
         'sector': updateMarketDataUtilities.get_sector(info, ticker),
         'industry': updateMarketDataUtilities.get_industry(info, ticker),
@@ -126,10 +208,9 @@ def yahoo_fetch_market_data(ticker: str, request_pause: float = 0) -> dict:
         'statistics': updateMarketDataUtilities.get_statistics(info, ticker),
         'updatedAt': datetime.now(),
     }
-    # price history can only reuse this download when the history symbol matches
-    # the ticker (crypto tickers map BTC -> BTC-USD for history)
-    if yahoo_crypto_symbol(ticker) == ticker:
-        data['_history'] = hist
+    # Downloaded under the mapped symbol, so it is the right series for this ticker
+    # either way — get_price_history reuses it instead of downloading again.
+    data['_history'] = hist
     return data
 
 
@@ -558,7 +639,7 @@ def update_statistics():
         return jsonify({'status': 'skipped', 'reason': 'custom asset ticker', 'ticker': ticker}), 200
 
     try:
-        info = yf.Ticker(yahoo_crypto_symbol(ticker)).info
+        info = ticker_info(yahoo_crypto_symbol(ticker))
         stats = updateMarketDataUtilities.get_statistics(info, ticker)
     except Exception as e:
         print(f'[statistics] Error fetching {ticker}: {e}')
@@ -622,8 +703,10 @@ def run_sec_bulk_task(tickers: list[str], pause_seconds: float):
               f"{pause_seconds}s between tickers)...")
 
         for i, ticker in enumerate(tickers, 1):
-            if i > 1 and pause_seconds > 0:
-                time.sleep(pause_seconds)
+            if i > 1 and pause_seconds > 0 and not _sleep_unless_cancelled(pause_seconds, sec_bulk_lock, sec_bulk_status):
+                break
+            if _cancelled(sec_bulk_lock, sec_bulk_status):
+                break
             with sec_bulk_lock:
                 sec_bulk_status["currentTicker"] = ticker
 
@@ -657,6 +740,13 @@ def run_sec_bulk_task(tickers: list[str], pause_seconds: float):
         print(f"[{datetime.now()}] [sec-bulk] Task finished.")
     finally:
         with sec_bulk_lock:
+            if sec_bulk_status["cancelRequested"]:
+                # never clobber a throttle abort — that reason matters more
+                if not sec_bulk_status["abortedReason"]:
+                    sec_bulk_status["abortedReason"] = "cancelled by user"
+                print(f"[{datetime.now()}] [sec-bulk] Cancelled after "
+                      f"{sec_bulk_status['processed']}/{sec_bulk_status['total']} tickers.")
+            sec_bulk_status["cancelRequested"] = False
             sec_bulk_status["running"] = False
             sec_bulk_status["currentTicker"] = None
             sec_bulk_status["finishedAt"] = datetime.now().isoformat()
@@ -731,10 +821,28 @@ def update_sec_all_status():
         return jsonify(dict(sec_bulk_status)), 200
 
 
+@app.route('/update/sec/all/cancel', methods=['POST'])
+def update_sec_all_cancel():
+    """
+    Ask the running SEC backfill to stop. Cooperative: the ticker in flight
+    finishes its ~15 SEC requests first (up to ~75 s at the default pacing), then
+    the run ends. Everything already written stays; re-run later to continue.
+    """
+    with sec_bulk_lock:
+        if not sec_bulk_status["running"]:
+            return jsonify({"status": "not_running"}), 409
+        sec_bulk_status["cancelRequested"] = True
+        return jsonify({
+            "status": "cancelling",
+            "processed": sec_bulk_status["processed"],
+            "total": sec_bulk_status["total"],
+            "currentTicker": sec_bulk_status["currentTicker"],
+        }), 202
+
+
 def fetch_shares_outstanding(ticker: str):
     """Fetch only sharesOutstanding for a ticker from Yahoo Finance (IOB .IL → .L fallback)."""
-    stock = yf.Ticker(ticker)
-    return get_shares_with_fallback(ticker, stock.info)
+    return get_shares_with_fallback(ticker, ticker_info(ticker))
 
 
 @app.route('/update/sharesOutstanding', methods=['POST'])
@@ -802,8 +910,38 @@ def update_shares_outstanding():
     }), 200
 
 
-def get_monthly_price_history(ticker: str) -> bool:
-    """Fetch monthly price history from yfinance and store in MongoDB. Returns True on success."""
+def monthly_from_daily(daily_entries: list) -> list:
+    """
+    Last close of each calendar month from a stored daily series
+    ([{date: 'YYYY-MM-DD', price}] ascending). Matches Yahoo's own interval='1mo'
+    bars exactly (verified across 500 shared months) and reaches further back —
+    Yahoo caps the monthly endpoint at 500 bars while the daily series does not.
+    """
+    by_month: dict[str, float] = {}
+    for entry in daily_entries or []:
+        date = entry.get('date')
+        price = entry.get('price')
+        if not date or price is None:
+            continue
+        by_month[str(date)[:7]] = float(price)  # ascending input → last write wins
+    return [{'date': m, 'price': round(by_month[m], 4)} for m in sorted(by_month)]
+
+
+def get_monthly_price_history(ticker: str, daily_entries: list | None = None) -> bool:
+    """
+    Store monthly price history. Derived from an already-stored daily series when
+    one is passed (no Yahoo request at all); otherwise downloaded. Returns True on success.
+    """
+    if daily_entries:
+        entries = monthly_from_daily(daily_entries)
+        if not entries:
+            return False
+        price_history_collection.update_one(
+            {'_id': ticker},
+            {'$set': {'monthlyHistory': entries, 'lastUpdated': datetime.now().strftime('%Y-%m-%d')}},
+            upsert=True,
+        )
+        return True
     try:
         stock = yf.Ticker(yahoo_crypto_symbol(ticker))
         hist = stock.history(period='max', interval='1mo')
@@ -836,8 +974,12 @@ def update_full():
     if not result['success']:
         return jsonify({'status': 'error', 'error': result['error'], 'ticker': ticker}), 500
 
-    daily_ok = get_price_history(ticker)
-    monthly_ok = get_monthly_price_history(ticker)
+    # The daily series was already written from the frame that fetch downloaded —
+    # re-downloading it here was a straight duplicate. Monthly is folded out of it.
+    cached = price_history_collection.find_one({'_id': ticker}, {'history': 1}) or {}
+    daily_entries = cached.get('history') or []
+    daily_ok = bool(daily_entries)
+    monthly_ok = get_monthly_price_history(ticker, daily_entries)
 
     return jsonify({
         'status': 'success',
@@ -870,6 +1012,7 @@ def run_throttled_task(pause_seconds: float):
         with throttled_lock:
             throttled_status.update({
                 "total": total, "processed": 0, "updated": 0, "failed": [],
+                "abortedReason": None,
                 "startedAt": datetime.now().isoformat(), "finishedAt": None,
             })
 
@@ -882,8 +1025,10 @@ def run_throttled_task(pause_seconds: float):
             return yahoo_fetch_market_data(t, request_pause=pause_seconds)
 
         for i, ticker in enumerate(ticker_symbols, 1):
-            if i > 1:
-                time.sleep(pause_seconds)
+            if i > 1 and not _sleep_unless_cancelled(pause_seconds, throttled_lock, throttled_status):
+                break
+            if _cancelled(throttled_lock, throttled_status):
+                break
 
             processed_ticker, operation, error = process_ticker(
                 ticker, throttled_yahoo_fetch, request_pause=pause_seconds)
@@ -910,6 +1055,11 @@ def run_throttled_task(pause_seconds: float):
         print(f"[{datetime.now()}] [throttled] Task finished.")
     finally:
         with throttled_lock:
+            if throttled_status["cancelRequested"]:
+                throttled_status["abortedReason"] = "cancelled by user"
+                print(f"[{datetime.now()}] [throttled] Cancelled after "
+                      f"{throttled_status['processed']}/{throttled_status['total']} tickers.")
+            throttled_status["cancelRequested"] = False
             throttled_status["running"] = False
             throttled_status["finishedAt"] = datetime.now().isoformat()
 
@@ -949,6 +1099,24 @@ def update_throttled():
 def update_throttled_status():
     with throttled_lock:
         return jsonify(dict(throttled_status)), 200
+
+
+@app.route('/update/throttled/cancel', methods=['POST'])
+def update_throttled_cancel():
+    """
+    Ask the running throttled batch to stop. Cooperative: the ticker in flight is
+    finished and written, then the run ends — nothing is rolled back, and the
+    queue keeps whatever was not reached, so a later run continues from there.
+    """
+    with throttled_lock:
+        if not throttled_status["running"]:
+            return jsonify({"status": "not_running"}), 409
+        throttled_status["cancelRequested"] = True
+        return jsonify({
+            "status": "cancelling",
+            "processed": throttled_status["processed"],
+            "total": throttled_status["total"],
+        }), 202
 
 
 # ---------- Swagger UI (manual endpoint testing) ----------
@@ -1121,7 +1289,19 @@ OPENAPI_SPEC = {
         '/update/sec/all/status': {
             'get': {
                 'summary': 'Progress of the current/last SEC bulk backfill',
-                'responses': {'200': {'description': '{running, total, processed, fundamentalsUpdated, sharesUpdated, noData[], failed[], currentTicker, abortedReason, startedAt, finishedAt}'}},
+                'responses': {'200': {'description': '{running, total, processed, fundamentalsUpdated, sharesUpdated, noData[], failed[], currentTicker, cancelRequested, abortedReason, startedAt, finishedAt}'}},
+            },
+        },
+        '/update/sec/all/cancel': {
+            'post': {
+                'summary': 'Stop the running SEC bulk backfill',
+                'description': (
+                    'Cooperative stop. The ticker in flight finishes its ~15 SEC requests first '
+                    '(up to ~75 s at default pacing), then the run ends with abortedReason '
+                    '"cancelled by user". Work already written stays; re-run later to continue.'
+                ),
+                'responses': {'202': {'description': '{status: "cancelling", processed, total, currentTicker}'},
+                              '409': {'description': 'No SEC bulk run is in progress'}},
             },
         },
         '/update/throttled': {
@@ -1142,7 +1322,19 @@ OPENAPI_SPEC = {
         '/update/throttled/status': {
             'get': {
                 'summary': 'Progress of the current/last throttled batch',
-                'responses': {'200': {'description': '{running, total, processed, updated, failed[], startedAt, finishedAt}'}},
+                'responses': {'200': {'description': '{running, total, processed, updated, failed[], cancelRequested, abortedReason, startedAt, finishedAt}'}},
+            },
+        },
+        '/update/throttled/cancel': {
+            'post': {
+                'summary': 'Stop the running throttled batch',
+                'description': (
+                    'Cooperative stop. The ticker in flight is finished and written, then the run '
+                    'ends with abortedReason "cancelled by user". Tickers not reached stay in the '
+                    'queue, so a later run continues from there.'
+                ),
+                'responses': {'202': {'description': '{status: "cancelling", processed, total}'},
+                              '409': {'description': 'No throttled batch is in progress'}},
             },
         },
         '/update/exchangeRates': {
@@ -1195,6 +1387,362 @@ def apispec():
 @app.route('/apidocs')
 def apidocs():
     return SWAGGER_UI_HTML
+
+
+# ---------- Admin panel (one page, triggers the update endpoints) ----------
+
+ADMIN_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Market Data Admin</title>
+<style>
+  :root {
+    --bg: #0F172A; --panel: #1E293B; --panel2: #172033; --line: #334155;
+    --text: #E2E8F0; --muted: #94A3B8; --subtle: #64748B;
+    --accent: #6366F1; --ok: #10B981; --warn: #F59E0B; --err: #EF4444;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 60px; }
+  h1 { font-size: 20px; margin: 0; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .banner {
+    margin: 16px 0 20px; padding: 10px 12px; border-radius: 8px; font-size: 12.5px;
+    background: rgba(245,158,11,.12); border: 1px solid rgba(245,158,11,.35); color: #FCD34D;
+  }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 20px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .stat .k { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--subtle); }
+  .stat .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; }
+  .card h2 { font-size: 14px; margin: 0 0 2px; }
+  .card p.hint { color: var(--muted); font-size: 12px; margin: 0 0 14px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .row + .row { margin-top: 10px; }
+  label.f { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  input[type=text], input[type=number] {
+    background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 6px; padding: 7px 9px; font: inherit; font-size: 13px;
+  }
+  input[type=text] { text-transform: uppercase; }
+  input#secTickers { text-transform: uppercase; min-width: 260px; }
+  input[type=number] { width: 76px; }
+  button {
+    background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 6px; padding: 7px 12px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.1); }
+  button.danger { border-color: rgba(239,68,68,.5); color: #FCA5A5; }
+  button.danger:hover:not(:disabled) { background: rgba(239,68,68,.15); border-color: var(--err); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .seg { display: inline-flex; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 2px; }
+  .seg button { background: transparent; border: none; padding: 5px 10px; font-size: 12.5px; font-weight: 600; color: var(--muted); }
+  .seg button.on { background: var(--accent); color: #fff; border-radius: 4px; }
+  .bar { height: 8px; border-radius: 4px; background: var(--panel2); overflow: hidden; margin-top: 10px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  .prog { font-size: 12.5px; color: var(--muted); margin-top: 8px; font-variant-numeric: tabular-nums; }
+  .prog b { color: var(--text); }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--subtle); margin-right: 6px; }
+  .dot.run { background: var(--ok); animation: pulse 1.2s infinite; }
+  .dot.err { background: var(--err); }
+  @keyframes pulse { 50% { opacity: .3; } }
+  #log { max-height: 320px; overflow: auto; font: 12px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace; }
+  #log div { border-bottom: 1px solid rgba(51,65,85,.5); padding: 3px 0; white-space: pre-wrap; word-break: break-word; }
+  #log .t { color: var(--subtle); margin-right: 8px; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Market Data Admin</h1>
+      <div class="sub">portfolio-scripts-backend &middot; triggers the /update endpoints &middot; <a href="/apidocs">API docs</a></div>
+    </div>
+    <button onclick="loadSummary()">Refresh stats</button>
+  </header>
+
+  <div class="banner">
+    No authentication on this service. Keep port 5000 bound to loopback &mdash; anyone who can reach it can run these jobs.
+  </div>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="card">
+    <h2>Price update &mdash; one ticker</h2>
+    <p class="hint">auto routes crypto to CoinGecko and everything else to Yahoo. full also refreshes daily + monthly price history.</p>
+    <div class="row">
+      <input type="text" id="priceTicker" placeholder="AAPL" size="12">
+      <span class="seg" id="providerSeg">
+        <button class="on" data-p="auto">auto</button>
+        <button data-p="yahoo">yahoo</button>
+        <button data-p="crypto">crypto</button>
+        <button data-p="massive">massive</button>
+        <button data-p="full">full</button>
+      </span>
+      <button class="primary" onclick="updateOne()">Update ticker</button>
+      <button onclick="refreshDaily()">Daily history</button>
+    </div>
+    <div class="row">
+      <button onclick="queueBatch()">Queue batch for whole ticker queue (debounced 10 s)</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Throttled queue run</h2>
+    <p class="hint">Sequential Yahoo pass over the tickers queue, sleeping between every request. One run at a time.</p>
+    <div class="row">
+      <label class="f">pause <input type="number" id="thrPause" value="15" min="0" step="1"> s</label>
+      <button class="primary" id="thrStart" onclick="startThrottled()">Start run</button>
+      <button class="danger" id="thrStop" onclick="stopThrottled()" disabled>Stop</button>
+    </div>
+    <div class="bar"><i id="thrBar"></i></div>
+    <div class="prog" id="thrProg"><span class="dot"></span>idle</div>
+  </div>
+
+  <div class="card">
+    <h2>FX rates</h2>
+    <p class="hint">ECB reference rates into exchangeRates. The frontend converts every displayed total with these.</p>
+    <div class="row"><button class="primary" onclick="updateFx()">Refresh ECB rates</button></div>
+  </div>
+
+  <div class="card">
+    <h2>Statistics &amp; shares</h2>
+    <p class="hint">Per ticker. Shares outstanding with an empty ticker backfills every marketData doc.</p>
+    <div class="row">
+      <input type="text" id="statsTicker" placeholder="MSFT" size="12">
+      <button onclick="oneTicker('/update/statistics', 'statistics')">Yahoo statistics</button>
+      <button onclick="sharesOutstanding()">Shares outstanding</button>
+      <button onclick="oneTicker('/update/sharesOutstandingHistory', 'shares history (SEC)')">Shares history (SEC)</button>
+      <button onclick="oneTicker('/update/fundamentals', 'fundamentals (SEC)')">Fundamentals (SEC)</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>SEC bulk backfill</h2>
+    <p class="hint">Fundamentals + shares history for every marketData ticker, or the subset listed below. Slow &mdash; roughly 75 s per ticker at the default SEC pacing; aborts rather than pushing through a 429.</p>
+    <div class="row">
+      <label class="f">pause <input type="number" id="secPause" value="1" min="0" step="0.5"> s</label>
+      <input type="text" id="secTickers" placeholder="optional subset: MSFT, AAPL, MA">
+      <button class="primary" id="secStart" onclick="startSec()">Start backfill</button>
+      <button class="danger" id="secStop" onclick="stopSec()" disabled>Stop</button>
+    </div>
+    <div class="bar"><i id="secBar"></i></div>
+    <div class="prog" id="secProg"><span class="dot"></span>idle</div>
+  </div>
+
+  <div class="card">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+var provider = 'auto';
+document.getElementById('providerSeg').addEventListener('click', function (e) {
+  var b = e.target.closest('button');
+  if (!b) return;
+  provider = b.dataset.p;
+  [].forEach.call(this.querySelectorAll('button'), function (x) { x.classList.toggle('on', x === b); });
+});
+
+function log(msg, kind) {
+  var el = document.getElementById('log');
+  var d = document.createElement('div');
+  var t = new Date().toTimeString().slice(0, 8);
+  d.innerHTML = '<span class="t">' + t + '</span><span class="' + (kind || '') + '">' + msg + '</span>';
+  el.insertBefore(d, el.firstChild);
+  while (el.childNodes.length > 200) el.removeChild(el.lastChild);
+}
+
+function tick(id, required) {
+  var v = (document.getElementById(id).value || '').trim().toUpperCase();
+  if (!v && required) throw new Error('ticker is required');
+  return v;
+}
+
+// Every trigger goes through here so each call lands in the log with its status.
+function post(path, body, label) {
+  log(label + ' \\u2192 ' + path + (body && body.ticker ? ' [' + body.ticker + ']' : ''));
+  return fetch(path, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body || {})
+  }).then(function (r) {
+    return r.json().catch(function () { return {}; }).then(function (j) {
+      var kind = r.ok ? (j.status === 'error' ? 'err' : (j.status === 'no_data' || j.status === 'skipped' ? 'warn' : 'ok')) : 'err';
+      log(label + ' \\u2190 ' + r.status + ' ' + JSON.stringify(j), kind);
+      return {res: r, json: j};
+    });
+  }).catch(function (e) {
+    log(label + ' failed: ' + e.message, 'err');
+    throw e;
+  });
+}
+
+function guard(fn) { try { fn(); } catch (e) { log(e.message, 'err'); } }
+
+// Ticker-scoped endpoints: a missing ticker is a logged error, not a silent no-op.
+function oneTicker(path, label) {
+  guard(function () { post(path, {ticker: tick('statsTicker', true)}, label); });
+}
+
+function updateOne() {
+  guard(function () {
+    var t = tick('priceTicker', true);
+    var path = provider === 'full' ? '/update/full' : '/update/' + provider;
+    post(path, {ticker: t}, 'price ' + provider).then(loadSummary);
+  });
+}
+
+function refreshDaily() {
+  guard(function () {
+    var t = tick('priceTicker', true);
+    post('/history/refresh/' + encodeURIComponent(t), {}, 'daily history');
+  });
+}
+
+function queueBatch() {
+  if (provider === 'full') { log('full has no batch mode \\u2014 pick auto/yahoo/crypto/massive', 'warn'); return; }
+  if (!confirm('Schedule a ' + provider + ' batch over every ticker in the queue?')) return;
+  post('/update/' + provider, {}, 'batch ' + provider);
+}
+
+function sharesOutstanding() {
+  var t = (document.getElementById('statsTicker').value || '').trim().toUpperCase();
+  if (!t && !confirm('No ticker given \\u2014 backfill sharesOutstanding for EVERY marketData doc?')) return;
+  post('/update/sharesOutstanding', t ? {ticker: t} : {}, 'sharesOutstanding' + (t ? '' : ' (all)'));
+}
+
+function updateFx() {
+  post('/update/exchangeRates', {}, 'FX rates').then(loadSummary);
+}
+
+function startThrottled() {
+  var pause = Number(document.getElementById('thrPause').value);
+  if (!confirm('Start a throttled Yahoo run over the whole queue at ' + pause + 's per request?')) return;
+  post('/update/throttled', {pauseSeconds: pause}, 'throttled run').then(function () { pollThrottled(); });
+}
+
+function stopThrottled() {
+  document.getElementById('thrStop').disabled = true;
+  post('/update/throttled/cancel', {}, 'throttled cancel').then(function () { pollThrottled(); });
+}
+
+function stopSec() {
+  document.getElementById('secStop').disabled = true;
+  log('SEC cancel: the ticker in flight finishes first (up to ~75 s)', 'warn');
+  post('/update/sec/all/cancel', {}, 'SEC cancel').then(function () { pollSec(); });
+}
+
+function startSec() {
+  var pause = Number(document.getElementById('secPause').value);
+  var raw = (document.getElementById('secTickers').value || '').trim();
+  var body = {pauseSeconds: pause};
+  if (raw) body.tickers = raw.split(',').map(function (s) { return s.trim().toUpperCase(); }).filter(Boolean);
+  if (!confirm('Start SEC backfill' + (body.tickers ? ' for ' + body.tickers.length + ' ticker(s)' : ' for every marketData ticker') + '? This can run for hours.')) return;
+  post('/update/sec/all', body, 'SEC bulk').then(function (r) {
+    if (r.json && r.json.estimatedMinutes != null) log('SEC bulk estimate: ~' + r.json.estimatedMinutes + ' min for ' + r.json.tickers + ' tickers', 'warn');
+    pollSec();
+  });
+}
+
+function renderProgress(barId, progId, s, extra) {
+  var pct = s.total ? Math.round((s.processed / s.total) * 100) : 0;
+  document.getElementById(barId).style.width = pct + '%';
+  var dot = s.running ? 'dot run' : (s.abortedReason ? 'dot err' : 'dot');
+  var txt;
+  if (s.running) txt = '<b>' + s.processed + '/' + s.total + '</b> (' + pct + '%)';
+  else if (s.finishedAt) txt = 'finished <b>' + s.processed + '/' + s.total + '</b>';
+  else txt = 'idle';
+  if (s.currentTicker) txt += ' &middot; ' + s.currentTicker;
+  if (extra) txt += extra;
+  if (s.cancelRequested) txt += ' &middot; <span class="warn">stopping after current ticker\\u2026</span>';
+  if (s.failed && s.failed.length) txt += ' &middot; <span class="err">' + s.failed.length + ' failed</span>';
+  if (s.abortedReason) txt += ' &middot; <span class="err">aborted: ' + s.abortedReason + '</span>';
+  document.getElementById(progId).innerHTML = '<span class="' + dot + '"></span>' + txt;
+}
+
+var thrTimer = null, secTimer = null;
+
+function pollThrottled() {
+  fetch('/update/throttled/status').then(function (r) { return r.json(); }).then(function (s) {
+    renderProgress('thrBar', 'thrProg', s, s.updated ? ' &middot; ' + s.updated + ' updated' : '');
+    document.getElementById('thrStart').disabled = !!s.running;
+    // Stop stays live only while a run is going and no cancel is already pending.
+    document.getElementById('thrStop').disabled = !s.running || !!s.cancelRequested;
+    clearTimeout(thrTimer);
+    if (s.running) thrTimer = setTimeout(pollThrottled, 2000);
+    else loadSummary();
+  }).catch(function () { clearTimeout(thrTimer); });
+}
+
+function pollSec() {
+  fetch('/update/sec/all/status').then(function (r) { return r.json(); }).then(function (s) {
+    var extra = '';
+    if (s.fundamentalsUpdated || s.sharesUpdated) extra = ' &middot; ' + s.fundamentalsUpdated + ' fundamentals, ' + s.sharesUpdated + ' shares';
+    if (s.noData && s.noData.length) extra += ' &middot; <span class="warn">' + s.noData.length + ' no data</span>';
+    renderProgress('secBar', 'secProg', s, extra);
+    document.getElementById('secStart').disabled = !!s.running;
+    document.getElementById('secStop').disabled = !s.running || !!s.cancelRequested;
+    clearTimeout(secTimer);
+    // SEC runs are hours long — a slower poll is plenty and keeps the log quiet.
+    if (s.running) secTimer = setTimeout(pollSec, 5000);
+    else loadSummary();
+  }).catch(function () { clearTimeout(secTimer); });
+}
+
+function loadSummary() {
+  fetch('/admin/summary').then(function (r) { return r.json(); }).then(function (s) {
+    var cells = [
+      ['queue', s.queue], ['market data', s.marketData], ['custom (skipped)', s.customAssets],
+      ['fx rates', s.fxRates], ['price history', s.priceHistory],
+      ['fundamentals', s.fundamentals], ['shares history', s.sharesHistory],
+      ['last update', s.lastUpdatedAt ? s.lastUpdatedAt.replace('T', ' ').slice(0, 16) : '\\u2014']
+    ];
+    document.getElementById('stats').innerHTML = cells.map(function (c) {
+      return '<div class="stat"><div class="k">' + c[0] + '</div><div class="v">' + (c[1] == null ? '\\u2014' : c[1]) + '</div></div>';
+    }).join('');
+  }).catch(function (e) { log('summary failed: ' + e.message, 'err'); });
+}
+
+loadSummary();
+pollThrottled();
+pollSec();
+</script>
+</body>
+</html>"""
+
+
+@app.route('/admin')
+def admin_panel():
+    return ADMIN_HTML
+
+
+@app.route('/admin/summary')
+def admin_summary():
+    """Collection counts + the newest marketData write, for the admin panel header."""
+    newest = collection.find_one({'updatedAt': {'$ne': None}}, {'updatedAt': 1}, sort=[('updatedAt', -1)])
+    last_updated = newest.get('updatedAt') if newest else None
+    return jsonify({
+        'queue': tickers_collection.count_documents({}),
+        'marketData': collection.count_documents({}),
+        'customAssets': custom_assets_collection.count_documents({}),
+        'fxRates': db['exchangeRates'].count_documents({}),
+        'priceHistory': price_history_collection.count_documents({}),
+        'fundamentals': fundamentals_collection.count_documents({}),
+        'sharesHistory': shares_history_collection.count_documents({}),
+        'lastUpdatedAt': last_updated.isoformat() if last_updated else None,
+    }), 200
 
 
 if __name__ == '__main__':
