@@ -49,6 +49,7 @@ locks = {"yahoo": threading.Lock(), "massive": threading.Lock(),
 throttled_lock = threading.Lock()
 throttled_status = {
     "running": False,
+    "scope": None,   # "queue" | "holdings" | "all" — which ticker list the run took
     "total": 0,
     "processed": 0,
     "updated": 0,
@@ -189,7 +190,11 @@ def yahoo_fetch_market_data(ticker: str, request_pause: float = 0) -> dict:
     info = ticker_info(symbol, stock)
     if request_pause > 0:
         time.sleep(request_pause)
-    hist = stock.history(period='max')
+    # auto_adjust=False keeps BOTH columns in the one download: 'Adj Close' (total
+    # return, what the stored series has always been) and 'Close' (as quoted).
+    # Historical yield needs the unadjusted close — dividing a nominal dividend by a
+    # dividend-adjusted price inflates every past yield. Same request count either way.
+    hist = stock.history(period='max', auto_adjust=False)
     data = {
         'name': updateMarketDataUtilities.get_company_name(info, ticker),
         'price': updateMarketDataUtilities.get_current_price(info, ticker),
@@ -502,6 +507,31 @@ def update_crypto():
     return _handle_update("crypto", crypto_provider.fetch_market_data)
 
 
+def history_entries(hist) -> list:
+    """
+    Daily [{date, price, rawPrice}] from a history frame.
+
+    price    — total-return close ('Adj Close' when the frame carries one), the
+               series every existing consumer reads; unchanged.
+    rawPrice — close as quoted, dividends NOT adjusted out. Only the yield-history
+               math wants this: adjusted closes are back-scaled by every dividend
+               since, so ttmDividend/adjustedPrice reads years too rich.
+
+    Frames downloaded with auto_adjust=True have no 'Adj Close'; there both fields
+    carry the adjusted close, which is what the pre-rawPrice docs already hold.
+    """
+    adjusted = 'Adj Close' in hist.columns
+    entries = []
+    for idx, row in hist.iterrows():
+        close = float(row['Close'])
+        entries.append({
+            'date': str(idx.date()),
+            'price': round(float(row['Adj Close']) if adjusted else close, 4),
+            'rawPrice': round(close, 4),
+        })
+    return entries
+
+
 def get_price_history(ticker: str, hist=None) -> bool:
     """
     Store full daily price history in MongoDB. Fetches from yfinance unless a
@@ -510,13 +540,10 @@ def get_price_history(ticker: str, hist=None) -> bool:
     try:
         if hist is None:
             stock = yf.Ticker(yahoo_crypto_symbol(ticker))
-            hist = stock.history(period='max')
+            hist = stock.history(period='max', auto_adjust=False)
         if hist.empty:
             return False
-        entries = [
-            {'date': str(idx.date()), 'price': round(float(row['Close']), 4)}
-            for idx, row in hist.iterrows()
-        ]
+        entries = history_entries(hist)
         price_history_collection.update_one(
             {'_id': ticker},
             {'$set': {'ticker': ticker, 'history': entries, 'lastUpdated': datetime.now().strftime('%Y-%m-%d')}},
@@ -913,18 +940,24 @@ def update_shares_outstanding():
 def monthly_from_daily(daily_entries: list) -> list:
     """
     Last close of each calendar month from a stored daily series
-    ([{date: 'YYYY-MM-DD', price}] ascending). Matches Yahoo's own interval='1mo'
-    bars exactly (verified across 500 shared months) and reaches further back —
-    Yahoo caps the monthly endpoint at 500 bars while the daily series does not.
+    ([{date: 'YYYY-MM-DD', price, rawPrice}] ascending). Matches Yahoo's own
+    interval='1mo' bars exactly (verified across 500 shared months) and reaches
+    further back — Yahoo caps the monthly endpoint at 500 bars while the daily
+    series does not. rawPrice rides along when the daily entries carry one
+    (pre-rawPrice docs don't; the key is then simply absent).
     """
-    by_month: dict[str, float] = {}
+    by_month: dict[str, dict] = {}
     for entry in daily_entries or []:
         date = entry.get('date')
         price = entry.get('price')
         if not date or price is None:
             continue
-        by_month[str(date)[:7]] = float(price)  # ascending input → last write wins
-    return [{'date': m, 'price': round(by_month[m], 4)} for m in sorted(by_month)]
+        point = {'date': str(date)[:7], 'price': round(float(price), 4)}
+        raw = entry.get('rawPrice')
+        if raw is not None:
+            point['rawPrice'] = round(float(raw), 4)
+        by_month[point['date']] = point  # ascending input → last write wins
+    return [by_month[m] for m in sorted(by_month)]
 
 
 def get_monthly_price_history(ticker: str, daily_entries: list | None = None) -> bool:
@@ -944,13 +977,10 @@ def get_monthly_price_history(ticker: str, daily_entries: list | None = None) ->
         return True
     try:
         stock = yf.Ticker(yahoo_crypto_symbol(ticker))
-        hist = stock.history(period='max', interval='1mo')
+        hist = stock.history(period='max', interval='1mo', auto_adjust=False)
         if hist.empty:
             return False
-        entries = [
-            {'date': str(idx.date())[:7], 'price': round(float(row['Close']), 4)}
-            for idx, row in hist.iterrows()
-        ]
+        entries = [{**e, 'date': e['date'][:7]} for e in history_entries(hist)]
         price_history_collection.update_one(
             {'_id': ticker},
             {'$set': {'monthlyHistory': entries, 'lastUpdated': datetime.now().strftime('%Y-%m-%d')}},
@@ -990,27 +1020,49 @@ def update_full():
     }), 200
 
 
-def run_throttled_task(pause_seconds: float):
+THROTTLED_SCOPES = ('queue', 'holdings', 'all')
+
+
+def resolve_throttled_tickers(scope: str) -> tuple[list[str], list[str]]:
     """
-    Sequential batch over the tickers queue via Yahoo Finance, sleeping between
-    tickers to stay under rate limits. Each ticker is written to marketData and
-    removed from the queue immediately, so an interrupted run loses nothing.
+    Ticker list for a throttled run, by scope:
+      queue    — the 'tickers' work queue: only what a transaction enqueued since
+                 the last run, and emptied as it is processed (the default, and
+                 why a run usually covers a handful of tickers, not the portfolio)
+      holdings — every ticker currently held in any portfolio
+      all      — every ticker that already has a marketData doc, held or not
+    Returns (tickers, skipped_custom). Custom assets are never sent to a provider.
+    """
+    if scope == 'holdings':
+        raw = holdings_collection.distinct('ticker')
+    elif scope == 'all':
+        raw = collection.distinct('ticker')
+    else:
+        raw = tickers_collection.distinct('ticker')
+
+    custom_tickers = get_custom_tickers()
+    skipped_custom = sorted({str(t) for t in raw if t and str(t) in custom_tickers})
+    tickers = sorted({str(t) for t in raw if t and str(t) not in custom_tickers})
+
+    # A custom ticker sitting in the queue would be retried forever — drop it.
+    if scope == 'queue' and skipped_custom:
+        tickers_collection.delete_many({'ticker': {'$in': skipped_custom}})
+        print(f"[throttled] Skipped {len(skipped_custom)} custom asset tickers: {skipped_custom}")
+
+    return tickers, skipped_custom
+
+
+def run_throttled_task(ticker_symbols: list[str], pause_seconds: float, scope: str = 'queue'):
+    """
+    Sequential Yahoo update of the given tickers, sleeping between them to stay
+    under rate limits. Each ticker is written to marketData and removed from the
+    queue immediately, so an interrupted run loses nothing.
     """
     try:
-        cursor = tickers_collection.find({}, {'ticker': 1})
-        ticker_symbols: list[str] = list(set(str(doc.get('ticker')) for doc in cursor if doc.get('ticker')))
-
-        # Custom asset tickers never get provider updates — drop them from the queue unprocessed.
-        custom_tickers = get_custom_tickers()
-        skipped_custom = [t for t in ticker_symbols if t in custom_tickers]
-        if skipped_custom:
-            ticker_symbols = [t for t in ticker_symbols if t not in custom_tickers]
-            tickers_collection.delete_many({'ticker': {'$in': skipped_custom}})
-            print(f"[throttled] Skipped {len(skipped_custom)} custom asset tickers: {skipped_custom}")
-
         total = len(ticker_symbols)
         with throttled_lock:
             throttled_status.update({
+                "scope": scope,
                 "total": total, "processed": 0, "updated": 0, "failed": [],
                 "abortedReason": None,
                 "startedAt": datetime.now().isoformat(), "finishedAt": None,
@@ -1067,9 +1119,10 @@ def run_throttled_task(pause_seconds: float):
 @app.route('/update/throttled', methods=['POST'])
 def update_throttled():
     """
-    Start a background sequential update of every ticker in the 'tickers' queue,
-    pausing between Yahoo Finance calls (default 15 s, override via {"pauseSeconds": N}).
-    Returns immediately; poll GET /update/throttled/status for progress.
+    Start a background sequential Yahoo update, pausing between calls (default
+    15 s, override via {"pauseSeconds": N}). {"scope": "queue"|"holdings"|"all"}
+    picks the ticker list — see resolve_throttled_tickers. Returns immediately
+    with the resolved count; poll GET /update/throttled/status for progress.
     """
     data = request.get_json(silent=True) or {}
     try:
@@ -1079,19 +1132,41 @@ def update_throttled():
     if pause_seconds < 0:
         return jsonify({"status": "error", "error": "pauseSeconds must be >= 0"}), 400
 
+    scope = str(data.get('scope') or 'queue').lower()
+    if scope not in THROTTLED_SCOPES:
+        return jsonify({"status": "error",
+                        "error": f"scope must be one of {', '.join(THROTTLED_SCOPES)}"}), 400
+
+    # Resolved here, not in the worker, so the caller gets the real count up front.
+    tickers, skipped_custom = resolve_throttled_tickers(scope)
+    if not tickers:
+        return jsonify({"status": "error", "error": "no tickers to process",
+                        "scope": scope, "skippedCustom": len(skipped_custom)}), 400
+
     with throttled_lock:
         if throttled_status["running"]:
             return jsonify({
                 "status": "already_running",
+                "scope": throttled_status["scope"],
                 "processed": throttled_status["processed"],
                 "total": throttled_status["total"],
             }), 409
         throttled_status["running"] = True
 
-    threading.Thread(target=run_throttled_task, args=[pause_seconds], daemon=True).start()
+    threading.Thread(target=run_throttled_task, args=[tickers, pause_seconds, scope], daemon=True).start()
+
+    # Two pauses per ticker: one inside the fetch (.info -> history), one between tickers.
+    estimate_seconds = int((2 * len(tickers) - 1) * pause_seconds)
     return jsonify({
         "status": "started",
-        "message": f"Throttled Yahoo batch started ({pause_seconds}s pause between every Yahoo request)",
+        "scope": scope,
+        "tickers": len(tickers),
+        "skippedCustom": len(skipped_custom),
+        "pauseSeconds": pause_seconds,
+        "estimatedSeconds": estimate_seconds,
+        "estimatedMinutes": round(estimate_seconds / 60, 1),
+        "message": f"Throttled Yahoo batch started for {len(tickers)} tickers "
+                   f"(scope={scope}, {pause_seconds}s pause between every Yahoo request)",
     }), 202
 
 
@@ -1306,23 +1381,34 @@ OPENAPI_SPEC = {
         },
         '/update/throttled': {
             'post': {
-                'summary': 'Background sequential Yahoo update of the whole tickers queue, pausing between every Yahoo request (default 15 s)',
+                'summary': 'Background sequential Yahoo update, pausing between every Yahoo request (default 15 s)',
+                'description': (
+                    'scope picks the ticker list: "queue" (default) takes the tickers work queue — '
+                    'only what a transaction enqueued since the last run, emptied as it is processed; '
+                    '"holdings" takes every ticker currently held in any portfolio; "all" takes every '
+                    'ticker that has a marketData doc. Custom assets are always skipped. '
+                    'Roughly 4 Yahoo requests and 2 pauses per ticker.'
+                ),
                 'requestBody': {
                     'required': False,
                     'content': {'application/json': {'schema': {
                         'type': 'object',
-                        'properties': {'pauseSeconds': {'type': 'number', 'example': 15}},
+                        'properties': {
+                            'pauseSeconds': {'type': 'number', 'example': 15},
+                            'scope': {'type': 'string', 'enum': list(THROTTLED_SCOPES),
+                                      'example': 'holdings'},
+                        },
                     }}},
                 },
-                'responses': {'202': {'description': 'Batch started in background'},
-                              '400': {'description': 'Invalid pauseSeconds'},
+                'responses': {'202': {'description': '{status: "started", scope, tickers, skippedCustom, pauseSeconds, estimatedSeconds, estimatedMinutes}'},
+                              '400': {'description': 'Invalid pauseSeconds/scope, or nothing to process'},
                               '409': {'description': 'A throttled batch is already running'}},
             },
         },
         '/update/throttled/status': {
             'get': {
                 'summary': 'Progress of the current/last throttled batch',
-                'responses': {'200': {'description': '{running, total, processed, updated, failed[], cancelRequested, abortedReason, startedAt, finishedAt}'}},
+                'responses': {'200': {'description': '{running, scope, total, processed, updated, failed[], cancelRequested, abortedReason, startedAt, finishedAt}'}},
             },
         },
         '/update/throttled/cancel': {
@@ -1446,6 +1532,7 @@ ADMIN_HTML = """<!doctype html>
   .seg { display: inline-flex; background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 2px; }
   .seg button { background: transparent; border: none; padding: 5px 10px; font-size: 12.5px; font-weight: 600; color: var(--muted); }
   .seg button.on { background: var(--accent); color: #fff; border-radius: 4px; }
+  .seg button b { font-variant-numeric: tabular-nums; opacity: .7; font-weight: 700; margin-left: 3px; }
   .bar { height: 8px; border-radius: 4px; background: var(--panel2); overflow: hidden; margin-top: 10px; }
   .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
   .prog { font-size: 12.5px; color: var(--muted); margin-top: 8px; font-variant-numeric: tabular-nums; }
@@ -1498,9 +1585,17 @@ ADMIN_HTML = """<!doctype html>
   </div>
 
   <div class="card">
-    <h2>Throttled queue run</h2>
-    <p class="hint">Sequential Yahoo pass over the tickers queue, sleeping between every request. One run at a time.</p>
+    <h2>Throttled run</h2>
+    <p class="hint">Sequential Yahoo pass, sleeping between every request. One run at a time.
+      <b>Queue</b> = only what a transaction enqueued since the last run (it empties as it goes).
+      <b>Holdings</b> = every ticker you currently hold. <b>All</b> = every ticker with a marketData doc.
+      Custom assets are always skipped.</p>
     <div class="row">
+      <span class="seg" id="scopeSeg">
+        <button class="on" data-s="queue">Queue <b id="cntQueue">–</b></button>
+        <button data-s="holdings">Holdings <b id="cntHoldings">–</b></button>
+        <button data-s="all">All <b id="cntAll">–</b></button>
+      </span>
       <label class="f">pause <input type="number" id="thrPause" value="15" min="0" step="1"> s</label>
       <button class="primary" id="thrStart" onclick="startThrottled()">Start run</button>
       <button class="danger" id="thrStop" onclick="stopThrottled()" disabled>Stop</button>
@@ -1552,6 +1647,14 @@ document.getElementById('providerSeg').addEventListener('click', function (e) {
   var b = e.target.closest('button');
   if (!b) return;
   provider = b.dataset.p;
+  [].forEach.call(this.querySelectorAll('button'), function (x) { x.classList.toggle('on', x === b); });
+});
+
+var scope = 'queue';
+document.getElementById('scopeSeg').addEventListener('click', function (e) {
+  var b = e.target.closest('button');
+  if (!b) return;
+  scope = b.dataset.s;
   [].forEach.call(this.querySelectorAll('button'), function (x) { x.classList.toggle('on', x === b); });
 });
 
@@ -1629,8 +1732,14 @@ function updateFx() {
 
 function startThrottled() {
   var pause = Number(document.getElementById('thrPause').value);
-  if (!confirm('Start a throttled Yahoo run over the whole queue at ' + pause + 's per request?')) return;
-  post('/update/throttled', {pauseSeconds: pause}, 'throttled run').then(function () { pollThrottled(); });
+  var counts = {queue: 'cntQueue', holdings: 'cntHoldings', all: 'cntAll'};
+  var n = Number(document.getElementById(counts[scope]).textContent) || 0;
+  var mins = Math.round((2 * n - 1) * pause / 60);
+  if (!confirm('Start a throttled Yahoo run over ' + n + ' ticker(s) [' + scope + '] at ' + pause + 's per request?\\n\\nRoughly ' + mins + ' min.')) return;
+  post('/update/throttled', {pauseSeconds: pause, scope: scope}, 'throttled run [' + scope + ']').then(function (r) {
+    if (r.json && r.json.estimatedMinutes != null) log('throttled estimate: ~' + r.json.estimatedMinutes + ' min for ' + r.json.tickers + ' tickers', 'warn');
+    pollThrottled();
+  });
 }
 
 function stopThrottled() {
@@ -1676,7 +1785,8 @@ var thrTimer = null, secTimer = null;
 
 function pollThrottled() {
   fetch('/update/throttled/status').then(function (r) { return r.json(); }).then(function (s) {
-    renderProgress('thrBar', 'thrProg', s, s.updated ? ' &middot; ' + s.updated + ' updated' : '');
+    var thrExtra = (s.scope ? ' &middot; scope ' + s.scope : '') + (s.updated ? ' &middot; ' + s.updated + ' updated' : '');
+    renderProgress('thrBar', 'thrProg', s, thrExtra);
     document.getElementById('thrStart').disabled = !!s.running;
     // Stop stays live only while a run is going and no cancel is already pending.
     document.getElementById('thrStop').disabled = !s.running || !!s.cancelRequested;
@@ -1712,6 +1822,10 @@ function loadSummary() {
     document.getElementById('stats').innerHTML = cells.map(function (c) {
       return '<div class="stat"><div class="k">' + c[0] + '</div><div class="v">' + (c[1] == null ? '\\u2014' : c[1]) + '</div></div>';
     }).join('');
+    var sc = s.scopeCounts || {};
+    document.getElementById('cntQueue').textContent = sc.queue != null ? sc.queue : '\\u2013';
+    document.getElementById('cntHoldings').textContent = sc.holdings != null ? sc.holdings : '\\u2013';
+    document.getElementById('cntAll').textContent = sc.all != null ? sc.all : '\\u2013';
   }).catch(function (e) { log('summary failed: ' + e.message, 'err'); });
 }
 
@@ -1733,7 +1847,18 @@ def admin_summary():
     """Collection counts + the newest marketData write, for the admin panel header."""
     newest = collection.find_one({'updatedAt': {'$ne': None}}, {'updatedAt': 1}, sort=[('updatedAt', -1)])
     last_updated = newest.get('updatedAt') if newest else None
+    custom_tickers = get_custom_tickers()
+
+    def non_custom(values):
+        return len({str(t) for t in values if t and str(t) not in custom_tickers})
+
     return jsonify({
+        # what each throttled scope would actually process (custom assets excluded)
+        'scopeCounts': {
+            'queue': non_custom(tickers_collection.distinct('ticker')),
+            'holdings': non_custom(holdings_collection.distinct('ticker')),
+            'all': non_custom(collection.distinct('ticker')),
+        },
         'queue': tickers_collection.count_documents({}),
         'marketData': collection.count_documents({}),
         'customAssets': custom_assets_collection.count_documents({}),
