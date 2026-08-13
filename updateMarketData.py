@@ -5,6 +5,7 @@ from pymongo import MongoClient, UpdateOne, DeleteOne
 from datetime import datetime
 import threading
 import concurrent.futures
+import math
 import time
 import os
 
@@ -519,17 +520,35 @@ def history_entries(hist) -> list:
 
     Frames downloaded with auto_adjust=True have no 'Adj Close'; there both fields
     carry the adjusted close, which is what the pre-rawPrice docs already hold.
+
+    Rows with a non-finite close are dropped. Yahoo returns a NaN bar for a day it
+    has no close for yet (the current session, a halt), and a NaN survives into
+    Mongo as a Double the Java side cannot read at all: BigDecimal has no NaN, so
+    every consumer of the ticker's history fails on the document, not just on
+    that point.
     """
     adjusted = 'Adj Close' in hist.columns
     entries = []
     for idx, row in hist.iterrows():
-        close = float(row['Close'])
+        close = _finite(row['Close'])
+        price = _finite(row['Adj Close']) if adjusted else close
+        if close is None or price is None:
+            continue
         entries.append({
             'date': str(idx.date()),
-            'price': round(float(row['Adj Close']) if adjusted else close, 4),
+            'price': round(price, 4),
             'rawPrice': round(close, 4),
         })
     return entries
+
+
+def _finite(value):
+    """float(value) when it is a real number, else None (covers NaN, inf, None)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def get_price_history(ticker: str, hist=None) -> bool:
@@ -949,13 +968,13 @@ def monthly_from_daily(daily_entries: list) -> list:
     by_month: dict[str, dict] = {}
     for entry in daily_entries or []:
         date = entry.get('date')
-        price = entry.get('price')
+        price = _finite(entry.get('price'))  # NaN would poison the whole month
         if not date or price is None:
             continue
-        point = {'date': str(date)[:7], 'price': round(float(price), 4)}
-        raw = entry.get('rawPrice')
+        point = {'date': str(date)[:7], 'price': round(price, 4)}
+        raw = _finite(entry.get('rawPrice'))
         if raw is not None:
-            point['rawPrice'] = round(float(raw), 4)
+            point['rawPrice'] = round(raw, 4)
         by_month[point['date']] = point  # ascending input → last write wins
     return [by_month[m] for m in sorted(by_month)]
 

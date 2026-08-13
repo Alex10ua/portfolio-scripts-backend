@@ -182,6 +182,72 @@ class TestMergeList(unittest.TestCase):
         self.assertEqual(merged[0]['dividendAmount'], 2)
 
 
+class _FakeFrame:
+    """Minimal stand-in for a yfinance history frame: columns + iterrows()."""
+
+    def __init__(self, columns, rows):
+        self.columns = columns
+        self._rows = rows
+
+    def iterrows(self):
+        return iter(self._rows)
+
+
+class TestPriceHistoryEntries(unittest.TestCase):
+    """rawPrice is the close as quoted; price stays the total-return series every
+    existing consumer reads. Yield history divides nominal dividends by rawPrice —
+    using the adjusted close there reads past yields far too rich."""
+
+    def test_adjusted_frame_splits_the_two_closes(self):
+        from datetime import datetime
+        frame = _FakeFrame(['Close', 'Adj Close'], [
+            (datetime(2024, 1, 31), {'Close': 100.0, 'Adj Close': 92.5}),
+        ])
+        entries = updateMarketData.history_entries(frame)
+        self.assertEqual(entries, [{'date': '2024-01-31', 'price': 92.5, 'rawPrice': 100.0}])
+
+    def test_auto_adjusted_frame_carries_the_same_value_in_both(self):
+        from datetime import datetime
+        frame = _FakeFrame(['Close'], [(datetime(2024, 1, 31), {'Close': 92.5})])
+        entries = updateMarketData.history_entries(frame)
+        self.assertEqual(entries, [{'date': '2024-01-31', 'price': 92.5, 'rawPrice': 92.5}])
+
+    def test_monthly_fold_keeps_last_close_of_month_with_raw(self):
+        daily = [
+            {'date': '2024-01-30', 'price': 90.0, 'rawPrice': 98.0},
+            {'date': '2024-01-31', 'price': 92.5, 'rawPrice': 100.0},
+            {'date': '2024-02-29', 'price': 95.0, 'rawPrice': 103.0},
+        ]
+        self.assertEqual(updateMarketData.monthly_from_daily(daily), [
+            {'date': '2024-01', 'price': 92.5, 'rawPrice': 100.0},
+            {'date': '2024-02', 'price': 95.0, 'rawPrice': 103.0},
+        ])
+
+    def test_nan_close_is_dropped(self):
+        # Yahoo returns a NaN bar for a session with no close yet. A NaN reaches
+        # Mongo as a Double, and BigDecimal has no NaN — the Java side then fails
+        # to read the whole document, not just that point.
+        from datetime import datetime
+        frame = _FakeFrame(['Close', 'Adj Close'], [
+            (datetime(2026, 8, 11), {'Close': 385.04, 'Adj Close': 385.04}),
+            (datetime(2026, 8, 12), {'Close': float('nan'), 'Adj Close': float('nan')}),
+        ])
+        entries = updateMarketData.history_entries(frame)
+        self.assertEqual([e['date'] for e in entries], ['2026-08-11'])
+
+    def test_monthly_fold_drops_nan_prices(self):
+        daily = [
+            {'date': '2026-08-11', 'price': 385.04, 'rawPrice': 385.04},
+            {'date': '2026-08-12', 'price': float('nan'), 'rawPrice': float('nan')},
+        ]
+        self.assertEqual(updateMarketData.monthly_from_daily(daily),
+                         [{'date': '2026-08', 'price': 385.04, 'rawPrice': 385.04}])
+
+    def test_monthly_fold_of_legacy_entries_has_no_raw_key(self):
+        daily = [{'date': '2019-06-28', 'price': 41.2}]
+        self.assertEqual(updateMarketData.monthly_from_daily(daily), [{'date': '2019-06', 'price': 41.2}])
+
+
 class TestRecordSharesHistory(unittest.TestCase):
 
     def setUp(self):
