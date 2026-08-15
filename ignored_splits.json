@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "Corporate actions Yahoo reports in its 'Stock Splits' field that are NOT share splits.",
+    "Yahoo has one field for every price-basis-changing action, and yfinance surfaces it with",
+    "no type discriminator, so a spin-off arrives looking exactly like a split.",
+    "",
+    "Anything listed here is dropped at ingest: it never reaches marketData.splits, so nothing",
+    "downstream applies it. That matters most for share counts — HoldingServiceImpl.accumulate",
+    "multiplies transaction quantities by every split dated after them, so a phantom 1.057 turns",
+    "5 shares into 5.228. Transaction prices and average cost are never rewritten; dropping the",
+    "action simply leaves the booked figures alone.",
+    "",
+    "How to spot one: real splits are board-declared in round terms (2:1, 3:2, 1:10). A ratio like",
+    "1057:1000 is a computed price quotient — the signature of a spin-off. Ingest logs a WARNING",
+    "for any unlisted ratio between 0.85 and 1.18, which is where these land; add an entry here",
+    "when one shows up and is not a real split.",
+    "",
+    "Matching is on ticker + calendar date, and on yf_ratio when given (tolerance, not equality).",
+    "A different ratio on the same date does NOT match — it is treated as a new, unreviewed action.",
+    "",
+    "action_type: SPINOFF | OTHER. Genuine SPLIT and STOCK_DIVIDEND actions do not belong here —",
+    "they really do change the share count and must stay applied."
+  ],
+  "ignored": [
+    {
+      "ticker": "SPGI",
+      "action_date": "2026-07-01",
+      "yf_ratio": 1.057,
+      "action_type": "SPINOFF",
+      "spun_off_ticker": "MBGL",
+      "source_url": "",
+      "note": "Spin-off of Mobility Global Inc. (NYSE: MBGL), effective 12:01 a.m. ET 2026-07-01, record date 2026-06-15, one MBGL share per SPGI share. SPGI share count unchanged; only the price basis moved."
+    }
+  ]
+}

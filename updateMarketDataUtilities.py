@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+import corporate_actions
+
 
 def get_yearly_dividend(stock_info, ticker):
     try:
@@ -54,11 +56,19 @@ def get_dividends(dividends_series, ticker):
     return dividends
 
 def get_splits(splits_series, ticker):
+    """
+    Splits for a ticker, with the actions listed in ignored_splits.json removed.
+
+    Yahoo files spin-offs in the same 'Stock Splits' field as real splits, and one
+    applied as a split corrupts every share count derived from it. See
+    corporate_actions.py.
+    """
     try:
         splits = [
         {'splitDate': date, 'ratioSplit': split}
            for date, split in splits_series.items()
         ] or []
+        splits = corporate_actions.filter_splits(splits, ticker)
     except Exception as e:
            print(f"Error getting splits for {ticker}: {e}")
            splits = []
