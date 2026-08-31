@@ -8,6 +8,7 @@ import concurrent.futures
 import math
 import time
 import os
+import traceback
 
 import updateMarketDataUtilities
 import massive_provider
@@ -48,19 +49,38 @@ locks = {"yahoo": threading.Lock(), "massive": threading.Lock(),
 
 # Throttled sequential batch — one run at a time
 throttled_lock = threading.Lock()
+# Live event feed for the run: the admin panel polls the status endpoint with a
+# cursor (?sinceSeq=) and appends whatever is new to its log, so an hour-long run
+# reads as it happens instead of as one summary at the end. Capped — these are
+# progress lines, not an audit trail; stdout keeps the full record.
+THROTTLED_EVENT_CAP = 200
 throttled_status = {
     "running": False,
     "scope": None,   # "queue" | "holdings" | "all" — which ticker list the run took
     "total": 0,
     "processed": 0,
     "updated": 0,
+    # {ticker, stage, error, at} per entry — a bare ticker list never said whether
+    # Yahoo refused it or Mongo did, which is the first thing you ask.
     "failed": [],
+    "pauseSeconds": None,
+    "currentTicker": None,
+    "currentStage": None,   # fetching | saving | waiting | paused
+    "lastError": None,
     # Cooperative stop: the worker thread checks this between tickers. Killing a
     # thread mid-write is not an option, so a cancel finishes the ticker in flight.
     "cancelRequested": False,
+    # Cooperative pause, same rule: the ticker in flight is finished and written,
+    # then the worker parks between tickers until resumed. The run stays "running"
+    # (and keeps its slot) while paused, so nothing can start on top of it.
+    "paused": False,
+    "pausedAt": None,
+    "pausedSeconds": 0.0,
     "abortedReason": None,
     "startedAt": None,
     "finishedAt": None,
+    "events": [],
+    "eventSeq": 0,
 }
 
 # Bulk SEC EDGAR backfill — one run at a time (see run_sec_bulk_task)
@@ -100,6 +120,51 @@ def _sleep_unless_cancelled(seconds: float, lock, status) -> bool:
         time.sleep(step)
         remaining -= step
     return not _cancelled(lock, status)
+
+
+def throttled_event(level: str, message: str, ticker: str | None = None) -> None:
+    """
+    One line of run progress: printed to stdout (the full record) and appended to
+    the capped in-memory feed the admin panel streams. level is 'info'|'ok'|'warn'|'err'.
+    """
+    print(f"[throttled] {message}")
+    with throttled_lock:
+        throttled_status["eventSeq"] += 1
+        throttled_status["events"].append({
+            "seq": throttled_status["eventSeq"],
+            "at": datetime.now().isoformat(),
+            "level": level,
+            "ticker": ticker,
+            "message": message,
+        })
+        # Trim oldest first — a caller polling with a cursor gets whatever survives.
+        overflow = len(throttled_status["events"]) - THROTTLED_EVENT_CAP
+        if overflow > 0:
+            del throttled_status["events"][:overflow]
+
+
+def _wait_while_paused() -> bool:
+    """
+    Park the worker between tickers while the run is paused, waking every 0.5 s to
+    re-check. A cancel beats a pause (a Stop while paused must not hang until the
+    user remembers to resume). Returns False when the run should stop.
+    Time spent here is accumulated into pausedSeconds so the ETA stays honest.
+    """
+    paused_from = None
+    while True:
+        with throttled_lock:
+            if throttled_status["cancelRequested"]:
+                if paused_from is not None:
+                    throttled_status["pausedSeconds"] += time.monotonic() - paused_from
+                return False
+            if not throttled_status["paused"]:
+                if paused_from is not None:
+                    throttled_status["pausedSeconds"] += time.monotonic() - paused_from
+                return True
+            if paused_from is None:
+                paused_from = time.monotonic()
+                throttled_status["currentStage"] = "paused"
+        time.sleep(0.5)
 
 app = Flask(__name__)
 
@@ -1071,11 +1136,31 @@ def resolve_throttled_tickers(scope: str) -> tuple[list[str], list[str]]:
     return tickers, skipped_custom
 
 
+def _record_throttled_failure(ticker: str, stage: str, error: str, position: str) -> None:
+    """
+    Book one failed ticker with the reason and the stage it died at ('fetch' =
+    the provider never returned data, 'db' = it did and the write failed), so the
+    status answers *why* without a trip to the container logs.
+    """
+    with throttled_lock:
+        throttled_status["failed"].append({
+            "ticker": ticker,
+            "stage": stage,
+            "error": error,
+            "at": datetime.now().isoformat(),
+        })
+        throttled_status["lastError"] = f"{ticker}: {error}"
+    throttled_event('err', f"[{position}] {ticker} failed ({stage}): {error}", ticker)
+
+
 def run_throttled_task(ticker_symbols: list[str], pause_seconds: float, scope: str = 'queue'):
     """
     Sequential Yahoo update of the given tickers, sleeping between them to stay
     under rate limits. Each ticker is written to marketData and removed from the
     queue immediately, so an interrupted run loses nothing.
+
+    Pause and cancel are both checked between tickers only: the ticker in flight
+    is always finished and written first.
     """
     try:
         total = len(ticker_symbols)
@@ -1083,12 +1168,18 @@ def run_throttled_task(ticker_symbols: list[str], pause_seconds: float, scope: s
             throttled_status.update({
                 "scope": scope,
                 "total": total, "processed": 0, "updated": 0, "failed": [],
+                "pauseSeconds": pause_seconds,
+                "currentTicker": None, "currentStage": None, "lastError": None,
+                "paused": False, "pausedAt": None, "pausedSeconds": 0.0,
                 "abortedReason": None,
                 "startedAt": datetime.now().isoformat(), "finishedAt": None,
+                # Feed cleared per run, but eventSeq keeps counting for the life of
+                # the process: a poller's cursor must never go backwards under it.
+                "events": [],
             })
 
-        print(f"[{datetime.now()}] [throttled] Starting sequential update of {total} tickers "
-              f"({pause_seconds}s pause between every Yahoo request)...")
+        throttled_event('info', f"Starting sequential update of {total} tickers "
+                                f"[scope={scope}] ({pause_seconds}s pause between every Yahoo request)")
 
         # pause threaded through the fetch chain: info -> combined history download
         # (dividends + splits + daily prices in one request), plus between tickers below
@@ -1096,43 +1187,73 @@ def run_throttled_task(ticker_symbols: list[str], pause_seconds: float, scope: s
             return yahoo_fetch_market_data(t, request_pause=pause_seconds)
 
         for i, ticker in enumerate(ticker_symbols, 1):
-            if i > 1 and not _sleep_unless_cancelled(pause_seconds, throttled_lock, throttled_status):
+            if not _wait_while_paused():
                 break
+            if i > 1:
+                with throttled_lock:
+                    throttled_status["currentTicker"] = ticker
+                    throttled_status["currentStage"] = "waiting"
+                if not _sleep_unless_cancelled(pause_seconds, throttled_lock, throttled_status):
+                    break
+                # A pause landing during the inter-ticker sleep parks here, not
+                # mid-fetch — the whole point of pausing between tickers.
+                if not _wait_while_paused():
+                    break
             if _cancelled(throttled_lock, throttled_status):
                 break
+
+            position = f"{i}/{total}"
+            with throttled_lock:
+                throttled_status["currentTicker"] = ticker
+                throttled_status["currentStage"] = "fetching"
+            throttled_event('info', f"[{position}] {ticker}: fetching from Yahoo", ticker)
 
             processed_ticker, operation, error = process_ticker(
                 ticker, throttled_yahoo_fetch, request_pause=pause_seconds)
 
             if operation:
+                with throttled_lock:
+                    throttled_status["currentStage"] = "saving"
                 try:
                     collection.bulk_write([operation])
                     tickers_collection.delete_many({'ticker': processed_ticker})
-                    print(f"[throttled] [{i}/{total}] Updated {processed_ticker}")
                     with throttled_lock:
                         throttled_status["updated"] += 1
+                    throttled_event('ok', f"[{position}] {processed_ticker}: updated", processed_ticker)
                 except Exception as e:
-                    print(f"[throttled] [{i}/{total}] DB error for {processed_ticker}: {e}")
-                    with throttled_lock:
-                        throttled_status["failed"].append(processed_ticker)
+                    _record_throttled_failure(processed_ticker, 'db', str(e), position)
             else:
-                print(f"[throttled] [{i}/{total}] Failed to fetch {processed_ticker}: {error}")
-                with throttled_lock:
-                    throttled_status["failed"].append(processed_ticker)
+                _record_throttled_failure(processed_ticker, 'fetch', str(error), position)
 
             with throttled_lock:
                 throttled_status["processed"] = i
-
-        print(f"[{datetime.now()}] [throttled] Task finished.")
+                throttled_status["currentStage"] = None
+    except Exception as e:
+        # A worker that dies silently looks identical to one that finished: record
+        # the reason where the status endpoint shows it, and the trace on stderr.
+        traceback.print_exc()
+        with throttled_lock:
+            throttled_status["abortedReason"] = f"crashed: {e}"
+            throttled_status["lastError"] = str(e)
+        throttled_event('err', f"Run crashed: {e}")
     finally:
         with throttled_lock:
             if throttled_status["cancelRequested"]:
                 throttled_status["abortedReason"] = "cancelled by user"
-                print(f"[{datetime.now()}] [throttled] Cancelled after "
-                      f"{throttled_status['processed']}/{throttled_status['total']} tickers.")
+            processed, total_final = throttled_status["processed"], throttled_status["total"]
+            aborted = throttled_status["abortedReason"]
+            failed_count = len(throttled_status["failed"])
+            updated_count = throttled_status["updated"]
             throttled_status["cancelRequested"] = False
+            throttled_status["paused"] = False
+            throttled_status["pausedAt"] = None
+            throttled_status["currentTicker"] = None
+            throttled_status["currentStage"] = None
             throttled_status["running"] = False
             throttled_status["finishedAt"] = datetime.now().isoformat()
+        summary = (f"Finished {processed}/{total_final} — {updated_count} updated, "
+                   f"{failed_count} failed" + (f" — aborted: {aborted}" if aborted else ""))
+        throttled_event('warn' if aborted or failed_count else 'ok', summary)
 
 
 @app.route('/update/throttled', methods=['POST'])
@@ -1191,8 +1312,79 @@ def update_throttled():
 
 @app.route('/update/throttled/status', methods=['GET'])
 def update_throttled_status():
+    """
+    Progress of the current/last run. `?sinceSeq=N` returns only events newer than
+    seq N (a poller's cursor) — omit it for everything still buffered. `eventSeq`
+    is the newest sequence number, i.e. the cursor to send next time.
+    """
+    try:
+        since_seq = int(request.args.get('sinceSeq', 0))
+    except (TypeError, ValueError):
+        since_seq = 0
+
     with throttled_lock:
-        return jsonify(dict(throttled_status)), 200
+        snapshot = dict(throttled_status)
+        events = [e for e in snapshot["events"] if e["seq"] > since_seq]
+
+    snapshot["events"] = events
+    # Pauses stretch wall-clock time, so the ETA counts only tickers not yet done
+    # and assumes the run is resumed now. Two pauses per ticker, as in the estimate
+    # returned at start.
+    pause = snapshot.get("pauseSeconds")
+    remaining = max(snapshot["total"] - snapshot["processed"], 0)
+    snapshot["remainingTickers"] = remaining
+    snapshot["remainingSeconds"] = int(remaining * 2 * pause) if pause is not None else None
+    # The worker only books pause time when it resumes, so a hold in progress would
+    # otherwise read 0 for as long as it lasts — add the current one live.
+    paused_seconds = snapshot.get("pausedSeconds") or 0.0
+    if snapshot.get("paused") and snapshot.get("pausedAt"):
+        try:
+            paused_seconds += (datetime.now() - datetime.fromisoformat(snapshot["pausedAt"])).total_seconds()
+        except (TypeError, ValueError):
+            pass
+    snapshot["pausedSeconds"] = round(paused_seconds, 1)
+    return jsonify(snapshot), 200
+
+
+@app.route('/update/throttled/pause', methods=['POST'])
+def update_throttled_pause():
+    """
+    Hold the running batch after the ticker in flight. The run keeps its slot
+    (status stays running=true, paused=true) so nothing else can start over it,
+    and nothing is lost — resume continues with the next ticker in the same list.
+    """
+    with throttled_lock:
+        if not throttled_status["running"]:
+            return jsonify({"status": "not_running"}), 409
+        if throttled_status["cancelRequested"]:
+            return jsonify({"status": "cancelling"}), 409
+        if throttled_status["paused"]:
+            return jsonify({"status": "already_paused",
+                            "processed": throttled_status["processed"],
+                            "total": throttled_status["total"]}), 409
+        throttled_status["paused"] = True
+        throttled_status["pausedAt"] = datetime.now().isoformat()
+        processed, total = throttled_status["processed"], throttled_status["total"]
+
+    throttled_event('warn', f"Pause requested at {processed}/{total} — holding after the current ticker")
+    return jsonify({"status": "pausing", "processed": processed, "total": total}), 202
+
+
+@app.route('/update/throttled/resume', methods=['POST'])
+def update_throttled_resume():
+    """Let a paused batch carry on from where it stopped."""
+    with throttled_lock:
+        if not throttled_status["running"]:
+            return jsonify({"status": "not_running"}), 409
+        if not throttled_status["paused"]:
+            return jsonify({"status": "not_paused"}), 409
+        throttled_status["paused"] = False
+        throttled_status["pausedAt"] = None
+        throttled_status["currentStage"] = None
+        processed, total = throttled_status["processed"], throttled_status["total"]
+
+    throttled_event('info', f"Resumed at {processed}/{total}")
+    return jsonify({"status": "resumed", "processed": processed, "total": total}), 202
 
 
 @app.route('/update/throttled/cancel', methods=['POST'])
@@ -1201,16 +1393,20 @@ def update_throttled_cancel():
     Ask the running throttled batch to stop. Cooperative: the ticker in flight is
     finished and written, then the run ends — nothing is rolled back, and the
     queue keeps whatever was not reached, so a later run continues from there.
+    A paused run stops too: cancel beats pause, it does not wait for a resume.
     """
     with throttled_lock:
         if not throttled_status["running"]:
             return jsonify({"status": "not_running"}), 409
         throttled_status["cancelRequested"] = True
-        return jsonify({
-            "status": "cancelling",
-            "processed": throttled_status["processed"],
-            "total": throttled_status["total"],
-        }), 202
+        processed, total = throttled_status["processed"], throttled_status["total"]
+
+    throttled_event('warn', f"Stop requested at {processed}/{total} — ending after the current ticker")
+    return jsonify({
+        "status": "cancelling",
+        "processed": processed,
+        "total": total,
+    }), 202
 
 
 # ---------- Swagger UI (manual endpoint testing) ----------
@@ -1427,7 +1623,38 @@ OPENAPI_SPEC = {
         '/update/throttled/status': {
             'get': {
                 'summary': 'Progress of the current/last throttled batch',
-                'responses': {'200': {'description': '{running, scope, total, processed, updated, failed[], cancelRequested, abortedReason, startedAt, finishedAt}'}},
+                'description': (
+                    'failed[] entries are {ticker, stage, error, at} — stage "fetch" means the '
+                    'provider never returned data, "db" means the write failed. events[] is the '
+                    'live per-ticker feed; pass sinceSeq to get only what is new and use eventSeq '
+                    'as the next cursor.'
+                ),
+                'parameters': [{
+                    'name': 'sinceSeq', 'in': 'query', 'required': False,
+                    'schema': {'type': 'integer'}, 'example': 0,
+                    'description': 'Return only events with seq greater than this',
+                }],
+                'responses': {'200': {'description': '{running, paused, pausedAt, pausedSeconds, scope, total, processed, updated, failed[], pauseSeconds, currentTicker, currentStage, lastError, remainingTickers, remainingSeconds, cancelRequested, abortedReason, startedAt, finishedAt, events[], eventSeq}'}},
+            },
+        },
+        '/update/throttled/pause': {
+            'post': {
+                'summary': 'Pause the running throttled batch',
+                'description': (
+                    'Cooperative hold. The ticker in flight is finished and written, then the '
+                    'worker parks between tickers. The run keeps its slot (running stays true, '
+                    'paused becomes true), so nothing else can start over it; POST '
+                    '/update/throttled/resume carries on with the next ticker in the same list.'
+                ),
+                'responses': {'202': {'description': '{status: "pausing", processed, total}'},
+                              '409': {'description': 'Not running, already paused, or already cancelling'}},
+            },
+        },
+        '/update/throttled/resume': {
+            'post': {
+                'summary': 'Resume a paused throttled batch',
+                'responses': {'202': {'description': '{status: "resumed", processed, total}'},
+                              '409': {'description': 'No run in progress, or it is not paused'}},
             },
         },
         '/update/throttled/cancel': {
@@ -1436,7 +1663,8 @@ OPENAPI_SPEC = {
                 'description': (
                     'Cooperative stop. The ticker in flight is finished and written, then the run '
                     'ends with abortedReason "cancelled by user". Tickers not reached stay in the '
-                    'queue, so a later run continues from there.'
+                    'queue, so a later run continues from there. Works on a paused run too — '
+                    'cancel beats pause and does not wait for a resume.'
                 ),
                 'responses': {'202': {'description': '{status: "cancelling", processed, total}'},
                               '409': {'description': 'No throttled batch is in progress'}},
@@ -1608,7 +1836,8 @@ ADMIN_HTML = """<!doctype html>
     <p class="hint">Sequential Yahoo pass, sleeping between every request. One run at a time.
       <b>Queue</b> = only what a transaction enqueued since the last run (it empties as it goes).
       <b>Holdings</b> = every ticker you currently hold. <b>All</b> = every ticker with a marketData doc.
-      Custom assets are always skipped.</p>
+      Custom assets are always skipped. Pause holds the run after the ticker in flight and keeps its
+      place; every ticker and every failure reason streams into the log below.</p>
     <div class="row">
       <span class="seg" id="scopeSeg">
         <button class="on" data-s="queue">Queue <b id="cntQueue">–</b></button>
@@ -1617,6 +1846,7 @@ ADMIN_HTML = """<!doctype html>
       </span>
       <label class="f">pause <input type="number" id="thrPause" value="15" min="0" step="1"> s</label>
       <button class="primary" id="thrStart" onclick="startThrottled()">Start run</button>
+      <button id="thrHold" onclick="holdThrottled()" disabled>Pause</button>
       <button class="danger" id="thrStop" onclick="stopThrottled()" disabled>Stop</button>
     </div>
     <div class="bar"><i id="thrBar"></i></div>
@@ -1766,6 +1996,16 @@ function stopThrottled() {
   post('/update/throttled/cancel', {}, 'throttled cancel').then(function () { pollThrottled(); });
 }
 
+// One button, both ways: the poll rewrites its label from the run's paused flag.
+function holdThrottled() {
+  var btn = document.getElementById('thrHold');
+  var resume = btn.getAttribute('data-paused') === '1';
+  btn.disabled = true;
+  post('/update/throttled/' + (resume ? 'resume' : 'pause'), {}, 'throttled ' + (resume ? 'resume' : 'pause'))
+    .then(function () { pollThrottled(); })
+    .catch(function () { pollThrottled(); });
+}
+
 function stopSec() {
   document.getElementById('secStop').disabled = true;
   log('SEC cancel: the ticker in flight finishes first (up to ~75 s)', 'warn');
@@ -1787,13 +2027,14 @@ function startSec() {
 function renderProgress(barId, progId, s, extra) {
   var pct = s.total ? Math.round((s.processed / s.total) * 100) : 0;
   document.getElementById(barId).style.width = pct + '%';
-  var dot = s.running ? 'dot run' : (s.abortedReason ? 'dot err' : 'dot');
+  var dot = s.running ? (s.paused ? 'dot' : 'dot run') : (s.abortedReason ? 'dot err' : 'dot');
   var txt;
   if (s.running) txt = '<b>' + s.processed + '/' + s.total + '</b> (' + pct + '%)';
   else if (s.finishedAt) txt = 'finished <b>' + s.processed + '/' + s.total + '</b>';
   else txt = 'idle';
-  if (s.currentTicker) txt += ' &middot; ' + s.currentTicker;
+  if (s.currentTicker) txt += ' &middot; ' + s.currentTicker + (s.currentStage ? ' (' + s.currentStage + ')' : '');
   if (extra) txt += extra;
+  if (s.paused) txt += ' &middot; <span class="warn">paused</span>';
   if (s.cancelRequested) txt += ' &middot; <span class="warn">stopping after current ticker\\u2026</span>';
   if (s.failed && s.failed.length) txt += ' &middot; <span class="err">' + s.failed.length + ' failed</span>';
   if (s.abortedReason) txt += ' &middot; <span class="err">aborted: ' + s.abortedReason + '</span>';
@@ -1801,15 +2042,30 @@ function renderProgress(barId, progId, s, extra) {
 }
 
 var thrTimer = null, secTimer = null;
+// Cursor into the run's event feed — only what is new since the last poll is logged.
+var thrSeq = 0;
 
 function pollThrottled() {
-  fetch('/update/throttled/status').then(function (r) { return r.json(); }).then(function (s) {
+  fetch('/update/throttled/status?sinceSeq=' + thrSeq).then(function (r) { return r.json(); }).then(function (s) {
+    // Service restarted under us — seqs began again, so rewind the cursor.
+    if (s.eventSeq != null && s.eventSeq < thrSeq) thrSeq = 0;
+    (s.events || []).forEach(function (e) {
+      log('throttled: ' + e.message, e.level === 'info' ? '' : e.level);
+      if (e.seq > thrSeq) thrSeq = e.seq;
+    });
     var thrExtra = (s.scope ? ' &middot; scope ' + s.scope : '') + (s.updated ? ' &middot; ' + s.updated + ' updated' : '');
+    if (s.running && !s.paused && s.remainingSeconds) thrExtra += ' &middot; ~' + Math.round(s.remainingSeconds / 60) + ' min left';
+    if (s.paused && s.pausedSeconds) thrExtra += ' &middot; held ' + Math.round(s.pausedSeconds) + ' s';
     renderProgress('thrBar', 'thrProg', s, thrExtra);
     document.getElementById('thrStart').disabled = !!s.running;
     // Stop stays live only while a run is going and no cancel is already pending.
     document.getElementById('thrStop').disabled = !s.running || !!s.cancelRequested;
+    var hold = document.getElementById('thrHold');
+    hold.disabled = !s.running || !!s.cancelRequested;
+    hold.setAttribute('data-paused', s.paused ? '1' : '0');
+    hold.textContent = s.paused ? 'Resume' : 'Pause';
     clearTimeout(thrTimer);
+    // Paused still polls: the label, the ETA and a Stop landing meanwhile all need it.
     if (s.running) thrTimer = setTimeout(pollThrottled, 2000);
     else loadSummary();
   }).catch(function () { clearTimeout(thrTimer); });

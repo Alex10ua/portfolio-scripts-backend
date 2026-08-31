@@ -295,5 +295,182 @@ class TestRecordSharesHistory(unittest.TestCase):
         updateMarketData.record_shares_history('AAPL', 1000)
 
 
+class TestThrottledRun(unittest.TestCase):
+    """
+    Pause/resume, per-ticker failure reasons and the streamed event feed. The
+    worker runs in a thread with pauseSeconds=0 so only the cooperative checks
+    (not the sleeps) decide timing.
+    """
+
+    def setUp(self):
+        import threading
+        self.threading = threading
+        updateMarketData.collection.reset_mock(side_effect=True, return_value=True)
+        updateMarketData.tickers_collection.reset_mock(side_effect=True, return_value=True)
+        with updateMarketData.throttled_lock:
+            updateMarketData.throttled_status.update({
+                "running": False, "scope": None, "total": 0, "processed": 0,
+                "updated": 0, "failed": [], "pauseSeconds": None,
+                "currentTicker": None, "currentStage": None, "lastError": None,
+                "cancelRequested": False, "paused": False, "pausedAt": None,
+                "pausedSeconds": 0.0, "abortedReason": None,
+                "startedAt": None, "finishedAt": None, "events": [],
+            })
+
+    def _status(self, key):
+        with updateMarketData.throttled_lock:
+            return updateMarketData.throttled_status[key]
+
+    def _start(self, tickers):
+        """Start the worker the way the endpoint does: slot claimed, then thread."""
+        with updateMarketData.throttled_lock:
+            updateMarketData.throttled_status["running"] = True
+        t = self.threading.Thread(
+            target=updateMarketData.run_throttled_task, args=[tickers, 0, 'queue'], daemon=True)
+        t.start()
+        return t
+
+    def _wait_for(self, predicate, timeout=5.0):
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_fetch_failure_records_reason_and_stage(self):
+        def fake_process(ticker, provider_fn, request_pause=0):
+            if ticker == 'BAD':
+                return ticker, None, 'Yahoo said no'
+            return ticker, MagicMock(), None
+
+        with patch.object(updateMarketData, 'process_ticker', side_effect=fake_process):
+            self._start(['GOOD', 'BAD']).join(timeout=5)
+
+        failed = self._status('failed')
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]['ticker'], 'BAD')
+        self.assertEqual(failed[0]['stage'], 'fetch')
+        self.assertEqual(failed[0]['error'], 'Yahoo said no')
+        self.assertIn('Yahoo said no', self._status('lastError'))
+        self.assertEqual(self._status('updated'), 1)
+
+    def test_db_failure_recorded_as_db_stage(self):
+        updateMarketData.collection.bulk_write.side_effect = Exception('mongo down')
+        with patch.object(updateMarketData, 'process_ticker',
+                          side_effect=lambda t, fn, request_pause=0: (t, MagicMock(), None)):
+            self._start(['AAPL']).join(timeout=5)
+
+        failed = self._status('failed')
+        self.assertEqual(failed[0]['stage'], 'db')
+        self.assertEqual(failed[0]['error'], 'mongo down')
+        self.assertEqual(self._status('updated'), 0)
+
+    def test_worker_crash_recorded_as_aborted_reason(self):
+        def boom(ticker, provider_fn, request_pause=0):
+            raise RuntimeError('worker exploded')
+
+        with patch.object(updateMarketData, 'process_ticker', side_effect=boom):
+            self._start(['AAPL']).join(timeout=5)
+
+        self.assertIn('worker exploded', self._status('abortedReason'))
+        self.assertFalse(self._status('running'))
+
+    def test_pause_holds_then_resume_finishes(self):
+        seen = []
+
+        def fake_process(ticker, provider_fn, request_pause=0):
+            seen.append(ticker)
+            if ticker == 'A':
+                updateMarketData.update_throttled_pause()  # pause mid-ticker
+            return ticker, MagicMock(), None
+
+        with patch.object(updateMarketData, 'process_ticker', side_effect=fake_process):
+            thread = self._start(['A', 'B', 'C'])
+            # The ticker in flight always finishes; the hold lands before the next one.
+            self.assertTrue(self._wait_for(lambda: self._status('currentStage') == 'paused'))
+            self.assertEqual(seen, ['A'])
+            self.assertEqual(self._status('processed'), 1)
+            self.assertTrue(self._status('running'))
+
+            updateMarketData.update_throttled_resume()
+            thread.join(timeout=5)
+
+        self.assertEqual(seen, ['A', 'B', 'C'])
+        self.assertEqual(self._status('processed'), 3)
+        self.assertIsNone(self._status('abortedReason'))
+        self.assertFalse(self._status('paused'))
+
+    def test_cancel_beats_pause(self):
+        def fake_process(ticker, provider_fn, request_pause=0):
+            if ticker == 'A':
+                updateMarketData.update_throttled_pause()
+            return ticker, MagicMock(), None
+
+        with patch.object(updateMarketData, 'process_ticker', side_effect=fake_process):
+            thread = self._start(['A', 'B'])
+            self.assertTrue(self._wait_for(lambda: self._status('currentStage') == 'paused'))
+            # A stop must not wait for a resume that may never come.
+            updateMarketData.update_throttled_cancel()
+            thread.join(timeout=5)
+
+        self.assertEqual(self._status('processed'), 1)
+        self.assertEqual(self._status('abortedReason'), 'cancelled by user')
+        self.assertFalse(self._status('paused'))
+        self.assertFalse(self._status('running'))
+
+    def test_pause_endpoint_409_when_not_running(self):
+        body, code = updateMarketData.update_throttled_pause()
+        self.assertEqual(code, 409)
+        self.assertEqual(body['status'], 'not_running')
+
+        body, code = updateMarketData.update_throttled_resume()
+        self.assertEqual(code, 409)
+        self.assertEqual(body['status'], 'not_running')
+
+    def test_resume_409_when_running_but_not_paused(self):
+        with updateMarketData.throttled_lock:
+            updateMarketData.throttled_status["running"] = True
+        try:
+            body, code = updateMarketData.update_throttled_resume()
+        finally:
+            with updateMarketData.throttled_lock:
+                updateMarketData.throttled_status["running"] = False
+        self.assertEqual(code, 409)
+        self.assertEqual(body['status'], 'not_paused')
+
+    def test_events_carry_every_ticker_and_are_cursorable(self):
+        with patch.object(updateMarketData, 'process_ticker',
+                          side_effect=lambda t, fn, request_pause=0: (t, MagicMock(), None)):
+            self._start(['AAPL', 'MSFT']).join(timeout=5)
+
+        events = self._status('events')
+        messages = ' | '.join(e['message'] for e in events)
+        self.assertIn('AAPL: fetching from Yahoo', messages)
+        self.assertIn('AAPL: updated', messages)
+        self.assertIn('MSFT: updated', messages)
+        seqs = [e['seq'] for e in events]
+        self.assertEqual(seqs, sorted(seqs))
+
+        # sinceSeq is a cursor: everything up to it is already logged by the client.
+        cutoff = seqs[len(seqs) // 2]
+        with patch.object(updateMarketData, 'request') as req:
+            req.args.get.return_value = str(cutoff)
+            body, code = updateMarketData.update_throttled_status()
+        self.assertEqual(code, 200)
+        self.assertTrue(all(e['seq'] > cutoff for e in body['events']))
+        self.assertEqual(body['eventSeq'], seqs[-1])
+
+    def test_event_feed_is_capped(self):
+        with updateMarketData.throttled_lock:
+            updateMarketData.throttled_status["events"] = []
+        for i in range(updateMarketData.THROTTLED_EVENT_CAP + 25):
+            updateMarketData.throttled_event('info', f'line {i}')
+        events = self._status('events')
+        self.assertEqual(len(events), updateMarketData.THROTTLED_EVENT_CAP)
+        self.assertEqual(events[-1]['message'], f'line {updateMarketData.THROTTLED_EVENT_CAP + 24}')
+
+
 if __name__ == '__main__':
     unittest.main()
