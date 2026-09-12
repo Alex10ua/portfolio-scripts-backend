@@ -152,6 +152,37 @@ class TestMergeList(unittest.TestCase):
         # new entry wins
         self.assertEqual(merged[0]['dividendDate'].tzinfo, ny)
 
+    def test_legacy_utc_instant_collapses_into_new_string_date(self):
+        """The case the NY test cannot catch: an exchange *ahead* of UTC.
+
+        Documents written before action_day() hold the raw instant, which Mongo
+        reads back naive and in UTC — Frankfurt local midnight as 22:00 the day
+        before. The new write is the string '2025-05-05', so without the legacy
+        bridge in _day_key the two never match and every European/UK ticker
+        re-appends its whole dividend and split history on each update."""
+        from datetime import datetime
+        stored = [{'dividendDate': datetime(2025, 5, 4, 22, 0), 'dividendAmount': 2.25}]
+        fetched = [{'dividendDate': '2025-05-05', 'dividendAmount': 2.25}]
+        merged = updateMarketData._merge_list(stored, fetched, 'dividendDate')
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]['dividendDate'], '2025-05-05')
+
+    def test_legacy_london_split_instant_collapses(self):
+        from datetime import datetime
+        stored = [{'splitDate': datetime(2013, 8, 27, 23, 0), 'ratioSplit': 2}]
+        fetched = [{'splitDate': '2013-08-28', 'ratioSplit': 2}]
+        merged = updateMarketData._merge_list(stored, fetched, 'splitDate')
+        self.assertEqual(len(merged), 1)
+
+    def test_us_legacy_instant_keeps_its_own_day(self):
+        """New York's local midnight is 04:00 UTC on the same day — the bridge
+        must not roll those forward."""
+        from datetime import datetime
+        stored = [{'dividendDate': datetime(2025, 10, 1, 4, 0), 'dividendAmount': 0.27}]
+        fetched = [{'dividendDate': '2025-10-01', 'dividendAmount': 0.27}]
+        merged = updateMarketData._merge_list(stored, fetched, 'dividendDate')
+        self.assertEqual(len(merged), 1)
+
     def test_string_vs_datetime_same_day_dedups(self):
         from datetime import datetime
         existing = [{'dividendDate': datetime(2024, 2, 9), 'dividendAmount': 0.24}]

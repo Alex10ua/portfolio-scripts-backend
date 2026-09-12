@@ -2,7 +2,7 @@ from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 import yfinance as yf
 from pymongo import MongoClient, UpdateOne, DeleteOne
-from datetime import datetime
+from datetime import datetime, timedelta
 import threading
 import concurrent.futures
 import math
@@ -348,7 +348,36 @@ def _day_key(value) -> str:
     """Normalize a date-ish value (tz-aware Timestamp, naive datetime, or string)
     to a 'YYYY-MM-DD' string so entries from different providers/reads dedup as
     the same day. Mongo returns naive datetimes while yfinance yields tz-aware
-    Timestamps — as raw dict keys they never compare equal."""
+    Timestamps — as raw dict keys they never compare equal.
+
+    The day meant is always the *exchange's* calendar day — what
+    updateMarketDataUtilities.action_day now writes, and what the Finnhub and
+    Massive providers already wrote.
+
+    The legacy branch below bridges to documents written before that: a raw
+    tz-aware Timestamp stored as an instant comes back from Mongo naive and in
+    UTC, so an exchange ahead of UTC reads a day early (Frankfurt local midnight
+    is 22:00 the previous day, London 23:00). Keyed literally, the stored
+    '2025-05-04 22:00' never matched the '2025-05-05' being written, and every
+    European and UK ticker re-appended its whole dividend and split history on
+    each update — BAS.DE, ENI.MI, BN.PA, UKW.L all carried exact duplicates. US
+    tickers hid it: their local midnight is 04:00/05:00 UTC on the *same* day,
+    which is why the 2026-07-09 fix looked complete. An action is always dated at
+    some local midnight, so a stored time of day at or past noon can only be that
+    shift, and rolling it forward makes a legacy row collapse into the new
+    string-dated one instead of doubling it. Refreshing a ticker therefore heals
+    its document; migrate-action-dates.js does the same thing without the fetch.
+
+    corporate_actions._day_key needs no such bridge — it only ever sees freshly
+    fetched values, and matches them against ignored_splits.json, whose dates are
+    hand-written as the exchange's calendar day.
+    """
+    if hasattr(value, 'date') and callable(getattr(value, 'date')):
+        if getattr(value, 'tzinfo', None) is not None:
+            return str(value.date())                 # tz-aware: its own local day
+        if getattr(value, 'hour', 0) >= 12:          # legacy: stored instant, read back as UTC
+            return str((value + timedelta(days=1)).date())
+        return str(value.date())
     if hasattr(value, 'strftime'):
         return value.strftime('%Y-%m-%d')
     return str(value)[:10]

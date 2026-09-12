@@ -43,10 +43,36 @@ def get_close_price(stock_info, ticker):
         price_at_close = None
     return price_at_close
 
+def action_day(value) -> str:
+    """
+    The exchange's calendar day of a corporate action, as 'YYYY-MM-DD'.
+
+    yfinance dates an action at local midnight of the exchange's timezone and
+    hands back a tz-aware Timestamp. Stored raw, Mongo keeps the *instant*, so a
+    Frankfurt ex-date lands as 22:00 the previous day and Amsterdam's 2009-06-01
+    dividend reads back as 2009-05-31 — a day early, and in the wrong month
+    whenever the action falls on the 1st. The calendar day is what a dividend
+    or split actually is (nothing about it happens at an instant), so it is
+    stored as the day, not as a moment in time.
+
+    A string is what the daily price series already writes ('date': str(idx.date()))
+    and what the Finnhub and Massive providers already produce, so this brings the
+    Yahoo path in line rather than inventing a third representation. Spring reads
+    it into the LocalDate on Dividend/Splits through StringToLocalDateConverter,
+    which takes a full ISO date (see the 'YYYY-MM' note in CLAUDE.md for the shape
+    that does *not* work).
+    """
+    if hasattr(value, 'date') and callable(getattr(value, 'date')):
+        return str(value.date())     # tz-aware Timestamp -> its own local day
+    if hasattr(value, 'strftime'):
+        return value.strftime('%Y-%m-%d')
+    return str(value)[:10]
+
+
 def get_dividends(dividends_series, ticker):
     try:
         dividends = [
-            {'dividendDate': date, 'dividendAmount': dividend}
+            {'dividendDate': action_day(date), 'dividendAmount': dividend}
             for date, dividend in dividends_series.items()
         ] or []
 
@@ -65,7 +91,7 @@ def get_splits(splits_series, ticker):
     """
     try:
         splits = [
-        {'splitDate': date, 'ratioSplit': split}
+        {'splitDate': action_day(date), 'ratioSplit': split}
            for date, split in splits_series.items()
         ] or []
         splits = corporate_actions.filter_splits(splits, ticker)

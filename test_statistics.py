@@ -114,5 +114,50 @@ class TestGetStatistics(unittest.TestCase):
         self.assertEqual(len(out_keys), len(set(out_keys)))
 
 
+class TestActionDay(unittest.TestCase):
+    """A corporate action is a calendar day, not an instant. yfinance dates one at
+    local midnight of its exchange, so storing the raw value put every European and
+    UK action a day early — and in the previous month when it fell on the 1st."""
+
+    def test_tz_aware_keeps_its_local_day(self):
+        from datetime import datetime, timezone, timedelta
+        amsterdam = timezone(timedelta(hours=2))
+        self.assertEqual(
+            utils.action_day(datetime(2009, 6, 1, 0, 0, tzinfo=amsterdam)), '2009-06-01')
+
+    def test_tz_aware_west_of_utc_keeps_its_local_day(self):
+        from datetime import datetime, timezone, timedelta
+        new_york = timezone(timedelta(hours=-4))
+        self.assertEqual(
+            utils.action_day(datetime(2025, 10, 1, 0, 0, tzinfo=new_york)), '2025-10-01')
+
+    def test_naive_datetime(self):
+        from datetime import datetime
+        self.assertEqual(utils.action_day(datetime(2024, 2, 9)), '2024-02-09')
+
+    def test_string_passes_through_as_a_day(self):
+        self.assertEqual(utils.action_day('2024-02-09T00:00:00Z'), '2024-02-09')
+
+    def test_dividends_and_splits_are_dated_by_day(self):
+        from datetime import datetime, timezone, timedelta
+        frankfurt = timezone(timedelta(hours=2))
+        self.assertEqual(
+            utils.get_dividends(_Series({datetime(2025, 5, 5, 0, 0, tzinfo=frankfurt): 2.25}), 'BAS.DE'),
+            [{'dividendDate': '2025-05-05', 'dividendAmount': 2.25}])
+        self.assertEqual(
+            utils.get_splits(_Series({datetime(2018, 5, 3, 0, 0, tzinfo=frankfurt): 2.0}), 'BESI.AS'),
+            [{'splitDate': '2018-05-03', 'ratioSplit': 2.0}])
+
+
+class _Series:
+    """Just the .items() get_dividends/get_splits use, without pulling in pandas."""
+
+    def __init__(self, mapping):
+        self._mapping = mapping
+
+    def items(self):
+        return self._mapping.items()
+
+
 if __name__ == '__main__':
     unittest.main()
