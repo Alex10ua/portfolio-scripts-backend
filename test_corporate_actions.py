@@ -17,6 +17,11 @@ SPGI_ENTRY = next(e for e in corporate_actions.load_ignored()
                   if e['ticker'] == 'SPGI' and e['action_date'] == SPGI_SPINOFF_DAY)
 SPGI_RATIO = SPGI_ENTRY['yf_ratio']
 
+UL_CONSOLIDATION_DAY = '2025-12-09'
+UL_ENTRY = next(e for e in corporate_actions.load_ratio_overrides()
+                if e['ticker'] == 'UL' and e['action_date'] == UL_CONSOLIDATION_DAY)
+UL_YF_RATIO = UL_ENTRY['yf_ratio']
+
 
 class TestIgnoreList(unittest.TestCase):
     """Yahoo files spin-offs as splits. One applied as a split multiplies every
@@ -95,6 +100,88 @@ class TestIgnoreList(unittest.TestCase):
             corporate_actions.load_ignored(force_reload=True)
 
 
+class TestRatioOverrides(unittest.TestCase):
+    """The opposite of the ignore list: a real action Yahoo reports at too few digits.
+    Unilever's 8-for-9 consolidation arrives as 0.888, and that truncation shaves
+    0.0053 off every 6 shares held."""
+
+    def test_seeded_entry_is_a_real_action_kept_not_ignored(self):
+        self.assertEqual(UL_ENTRY['action_type'], 'CONSOLIDATION')
+        self.assertIsNone(
+            corporate_actions.find_ignored('UL', UL_CONSOLIDATION_DAY, UL_YF_RATIO))
+
+    def test_fraction_beats_a_written_out_decimal(self):
+        self.assertAlmostEqual(corporate_actions.override_ratio(UL_ENTRY), 8 / 9, places=15)
+
+    def test_exact_ratio_is_the_fallback(self):
+        self.assertAlmostEqual(
+            corporate_actions.override_ratio({'exact_ratio': 0.5}), 0.5)
+
+    def test_unusable_entry_yields_none(self):
+        self.assertIsNone(corporate_actions.override_ratio({}))
+        self.assertIsNone(corporate_actions.override_ratio(
+            {'ratio_numerator': 8, 'ratio_denominator': 0}))
+
+    def test_ratio_replaced_and_action_still_applied(self):
+        splits = [{'splitDate': UL_CONSOLIDATION_DAY, 'ratioSplit': UL_YF_RATIO}]
+        with redirect_stdout(io.StringIO()):
+            kept = corporate_actions.filter_splits(splits, 'UL')
+        self.assertEqual(len(kept), 1)
+        self.assertAlmostEqual(kept[0]['ratioSplit'], 8 / 9, places=15)
+        self.assertEqual(kept[0]['splitDate'], UL_CONSOLIDATION_DAY)
+
+    def test_input_list_is_not_mutated(self):
+        splits = [{'splitDate': UL_CONSOLIDATION_DAY, 'ratioSplit': UL_YF_RATIO}]
+        with redirect_stdout(io.StringIO()):
+            corporate_actions.filter_splits(splits, 'UL')
+        self.assertEqual(splits[0]['ratioSplit'], UL_YF_RATIO)
+
+    def test_override_matches_whatever_the_date_type(self):
+        eastern = timezone(timedelta(hours=-4))
+        stamp = _Timestamp(2025, 12, 9, tzinfo=eastern)
+        splits = [{'splitDate': stamp, 'ratioSplit': UL_YF_RATIO}]
+        with redirect_stdout(io.StringIO()):
+            kept = corporate_actions.filter_splits(splits, 'UL')
+        self.assertAlmostEqual(kept[0]['ratioSplit'], 8 / 9, places=15)
+
+    def test_different_ratio_same_day_is_not_overridden(self):
+        """A new, unreviewed action on the same date — same rule as the ignore list."""
+        splits = [{'splitDate': UL_CONSOLIDATION_DAY, 'ratioSplit': 2.0}]
+        with redirect_stdout(io.StringIO()):
+            kept = corporate_actions.filter_splits(splits, 'UL')
+        self.assertEqual(kept[0]['ratioSplit'], 2.0)
+
+    def test_other_ticker_same_day_untouched(self):
+        splits = [{'splitDate': UL_CONSOLIDATION_DAY, 'ratioSplit': UL_YF_RATIO}]
+        with redirect_stdout(io.StringIO()):
+            kept = corporate_actions.filter_splits(splits, 'KO')
+        self.assertEqual(kept[0]['ratioSplit'], UL_YF_RATIO)
+
+    def test_overridden_ratio_does_not_also_warn(self):
+        """It is in the spin-off band, but it has been reviewed — warning again is noise."""
+        splits = [{'splitDate': UL_CONSOLIDATION_DAY, 'ratioSplit': UL_YF_RATIO}]
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            corporate_actions.filter_splits(splits, 'UL')
+        self.assertNotIn('WARNING', buffer.getvalue())
+        self.assertIn('overridden', buffer.getvalue())
+
+    def test_unreadable_file_overrides_nothing(self):
+        original = corporate_actions._IGNORE_FILE
+        try:
+            corporate_actions._IGNORE_FILE = '/nonexistent/ignored_splits.json'
+            splits = [{'splitDate': UL_CONSOLIDATION_DAY, 'ratioSplit': UL_YF_RATIO}]
+            with redirect_stdout(io.StringIO()):
+                corporate_actions.load_ignored(force_reload=True)
+                corporate_actions.load_ratio_overrides(force_reload=True)
+                self.assertEqual(
+                    corporate_actions.filter_splits(splits, 'UL'), splits)
+        finally:
+            corporate_actions._IGNORE_FILE = original
+            corporate_actions.load_ignored(force_reload=True)
+            corporate_actions.load_ratio_overrides(force_reload=True)
+
+
 class TestGetSplitsIntegration(unittest.TestCase):
     """get_splits is the single funnel every Yahoo write path goes through."""
 
@@ -106,6 +193,15 @@ class TestGetSplitsIntegration(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             splits = updateMarketDataUtilities.get_splits(series, 'SPGI')
         self.assertEqual([s['ratioSplit'] for s in splits], [2.0])
+
+    def test_override_reaches_the_splits_list(self):
+        series = {
+            datetime(2025, 12, 9): UL_YF_RATIO,
+        }
+        with redirect_stdout(io.StringIO()):
+            splits = updateMarketDataUtilities.get_splits(series, 'UL')
+        self.assertEqual(len(splits), 1)
+        self.assertAlmostEqual(splits[0]['ratioSplit'], 8 / 9, places=15)
 
     def test_series_error_still_degrades_to_empty(self):
         with redirect_stdout(io.StringIO()):

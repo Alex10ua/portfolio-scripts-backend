@@ -19,7 +19,17 @@
     "A different ratio on the same date does NOT match — it is treated as a new, unreviewed action.",
     "",
     "action_type: SPINOFF | OTHER. Genuine SPLIT and STOCK_DIVIDEND actions do not belong here —",
-    "they really do change the share count and must stay applied."
+    "they really do change the share count and must stay applied.",
+    "",
+    "ratio_overrides is the opposite list: real actions whose ratio Yahoo reports at too few",
+    "digits. Same ticker + date (+ yf_ratio) matching; instead of dropping the action, the ratio",
+    "is replaced at ingest, so the corrected value is what reaches marketData.splits. Prefer",
+    "ratio_numerator/ratio_denominator — the RNS states a fraction, and writing 8/9 out as a",
+    "decimal is a typo waiting to happen; exact_ratio is the fallback for a non-fractional value.",
+    "An overridden ratio is treated as reviewed, so it does not also raise the band warning.",
+    "",
+    "_merge_list overwrites same-day entries, so one refresh of the ticker heals a stored ratio;",
+    "holdings then need a recalculation to pick the corrected share count up."
   ],
   "ignored": [
     {
@@ -30,6 +40,18 @@
       "spun_off_ticker": "MBGL",
       "source_url": "",
       "note": "Spin-off of Mobility Global Inc. (NYSE: MBGL), effective 12:01 a.m. ET 2026-07-01, record date 2026-06-15, one MBGL share per SPGI share. SPGI share count unchanged; only the price basis moved."
+    }
+  ],
+  "ratio_overrides": [
+    {
+      "ticker": "UL",
+      "action_date": "2025-12-09",
+      "yf_ratio": 0.888,
+      "ratio_numerator": 8,
+      "ratio_denominator": 9,
+      "action_type": "CONSOLIDATION",
+      "source_url": "https://www.sec.gov/Archives/edgar/data/0000217410/000021741025000070/a2025-12x08xverdixsharec.htm",
+      "note": "Unilever share consolidation, 8 new shares for every 9 existing (ADS holders likewise 8-for-9), effective 2025-12-09, alongside the demerger of The Magnum Ice Cream Company. A genuine share-count change, so it must stay applied — but Yahoo reports the ratio as 0.888 rather than 8/9 = 0.888888..., which shaves 0.0053 off every 6 shares held. The action falls in the spin-off warning band and was reviewed: it is the consolidation, not the TMICC demerger."
     }
   ]
 }
