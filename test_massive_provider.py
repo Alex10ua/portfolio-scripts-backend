@@ -1,3 +1,4 @@
+import importlib.util
 import unittest
 from unittest.mock import MagicMock, patch
 import sys
@@ -5,7 +6,16 @@ import os
 
 sys.path.append(os.getcwd())
 
-import massive_provider
+# Loaded from the file, not imported: test_update_logic.py puts a MagicMock under
+# 'massive_provider' in sys.modules at import time, and a patch addressed by module
+# path ('massive_provider.requests.get') then lands on the mock while the real
+# module makes a live HTTP call. patch.object on this instance cannot miss.
+_spec = importlib.util.spec_from_file_location(
+    'massive_provider_real',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'massive_provider.py'),
+)
+massive_provider = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(massive_provider)
 
 
 class TestMassiveProvider(unittest.TestCase):
@@ -29,7 +39,7 @@ class TestMassiveProvider(unittest.TestCase):
         }
 
     @patch.dict(os.environ, {'MASSIVE_API_KEY': 'test-key', 'MASSIVE_BASE_URL': 'https://api.massive.com/v1'})
-    @patch('massive_provider.requests.get')
+    @patch.object(massive_provider.requests, 'get')
     def test_fetch_market_data_correct_url_and_header(self, mock_get):
         mock_response = MagicMock()
         mock_response.json.return_value = self._sample_response()
@@ -45,7 +55,7 @@ class TestMassiveProvider(unittest.TestCase):
         mock_response.raise_for_status.assert_called_once()
 
     @patch.dict(os.environ, {'MASSIVE_API_KEY': 'test-key', 'MASSIVE_BASE_URL': 'https://api.massive.com/v1'})
-    @patch('massive_provider.requests.get')
+    @patch.object(massive_provider.requests, 'get')
     def test_fetch_market_data_field_mapping(self, mock_get):
         mock_response = MagicMock()
         mock_response.json.return_value = self._sample_response()
@@ -68,7 +78,7 @@ class TestMassiveProvider(unittest.TestCase):
         self.assertIn('updatedAt', result)
 
     @patch.dict(os.environ, {'MASSIVE_API_KEY': 'test-key', 'MASSIVE_BASE_URL': 'https://api.massive.com/v1'})
-    @patch('massive_provider.requests.get')
+    @patch.object(massive_provider.requests, 'get')
     def test_fetch_market_data_uses_companyName_fallback(self, mock_get):
         mock_response = MagicMock()
         mock_response.json.return_value = {'companyName': 'Fallback Corp'}
@@ -92,7 +102,7 @@ class TestMassiveProvider(unittest.TestCase):
         self.assertIn('MASSIVE_BASE_URL', str(ctx.exception))
 
     @patch.dict(os.environ, {'MASSIVE_API_KEY': 'test-key', 'MASSIVE_BASE_URL': 'https://api.massive.com/v1'})
-    @patch('massive_provider.requests.get')
+    @patch.object(massive_provider.requests, 'get')
     def test_fetch_market_data_surfaces_http_error(self, mock_get):
         import requests
         mock_response = MagicMock()
@@ -107,6 +117,22 @@ class TestMassiveProvider(unittest.TestCase):
         result = massive_provider._map_response('TEST', data)
         self.assertEqual(result['dividends'], [])
         self.assertEqual(result['splits'], [])
+
+    def test_map_response_drops_incomplete_list_entries(self):
+        # a '' amount inside a list is never stripped by process_ticker and read
+        # back as a null dividend on the Java side
+        data = {
+            'name': 'Test Co',
+            'dividends': [{'dividendDate': '2024-02-09', 'dividendAmount': 0.24},
+                          {'dividendDate': '2024-05-10'},
+                          {'dividendAmount': 0.25},
+                          'not-a-dict'],
+            'splits': [{'splitDate': '2020-08-31', 'ratioSplit': 4.0},
+                       {'splitDate': '2021-01-04', 'ratioSplit': ''}],
+        }
+        result = massive_provider._map_response('TEST', data)
+        self.assertEqual(result['dividends'], [{'dividendDate': '2024-02-09', 'dividendAmount': 0.24}])
+        self.assertEqual(result['splits'], [{'splitDate': '2020-08-31', 'ratioSplit': 4.0}])
 
 
 if __name__ == '__main__':

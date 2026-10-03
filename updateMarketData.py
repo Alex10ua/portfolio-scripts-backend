@@ -11,8 +11,8 @@ import os
 import traceback
 
 import updateMarketDataUtilities
+import corporate_actions
 import massive_provider
-import finnhub_provider
 import ecb_provider
 import crypto_provider
 import sec_edgar_provider
@@ -394,6 +394,28 @@ def _merge_list(existing: list, new: list, key: str) -> list:
     return list(merged.values())
 
 
+def _drop_ignored_splits(ticker: str, stored: list) -> list:
+    """
+    Stored splits minus the actions ignored_splits.json now lists.
+
+    corporate_actions.filter_splits only sees freshly fetched actions, and
+    _merge_list keeps every stored entry, so an action listed *after* it was
+    ingested — the normal order, since a spin-off gets noticed once it has already
+    skewed share counts — stayed in marketData.splits for good. Days go through
+    _day_key so a legacy instant-dated entry still matches its listing.
+    """
+    kept = []
+    for split in stored:
+        day = _day_key(split['splitDate']) if split.get('splitDate') else None
+        entry = corporate_actions.find_ignored(ticker, day, split.get('ratioSplit')) if day else None
+        if entry:
+            print(f"[corporate_actions] {ticker}: removing stored {entry.get('action_type', 'OTHER')} "
+                  f"{split.get('ratioSplit')} on {day} (listed in ignored_splits.json)")
+            continue
+        kept.append(split)
+    return kept
+
+
 def process_ticker(ticker: str, provider_fn, request_pause: float = 0) -> tuple[str, UpdateOne | None, str | None]:
     """
     Fetches data for a single ticker using the given provider and returns the update operation.
@@ -404,18 +426,32 @@ def process_ticker(ticker: str, provider_fn, request_pause: float = 0) -> tuple[
         market_data = provider_fn(ticker)
         # DataFrame piggybacked by yahoo_fetch_market_data — not BSON, must not reach $set
         hist = market_data.pop('_history', None)
+        # Set by crypto_provider: the history download below must ask Yahoo for the
+        # -USD pair even when no CRYPTO holding exists yet to say so.
+        crypto = market_data.pop('_crypto', None)
+        # Don't overwrite existing good data with blanks: a throttled/partial provider
+        # response returns '' / None for missing fields (e.g. price, currency,
+        # sharesOutstanding). Drop those so $set only writes real values.
+        market_data = {k: v for k, v in market_data.items() if v not in ('', None)}
+        if 'price' not in market_data and 'name' not in market_data:
+            # Yahoo answers an unknown or delisted symbol with an empty .info and an
+            # empty history, not an error. Writing that out upserted a price-less stub,
+            # reported success, dropped the ticker from the queue and let a watchlist
+            # add go through for a symbol that does not exist.
+            return ticker, None, 'provider returned no price and no name (unknown or delisted symbol?)'
+        if 'price' not in market_data:
+            # A previous close without the price it belongs to makes a fake day's
+            # change, and a fresh updatedAt would pass the stale price off as current.
+            market_data.pop('priceYesterday', None)
+            market_data.pop('updatedAt', None)
         existing = collection.find_one({'ticker': ticker}, {'dividends': 1, 'splits': 1}) or {}
         market_data['dividends'] = _merge_list(
             existing.get('dividends') or [], market_data.get('dividends') or [], 'dividendDate'
         )
         market_data['splits'] = _merge_list(
-            existing.get('splits') or [], market_data.get('splits') or [], 'splitDate'
+            _drop_ignored_splits(ticker, existing.get('splits') or []),
+            market_data.get('splits') or [], 'splitDate'
         )
-        # Don't overwrite existing good data with blanks: a throttled/partial provider
-        # response returns '' / None for missing fields (e.g. price, currency,
-        # sharesOutstanding). Drop those so $set only writes real values. Merged
-        # dividends/splits lists and the datetime updatedAt are never '' / None so stay.
-        market_data = {k: v for k, v in market_data.items() if v not in ('', None)}
         record_shares_history(ticker, market_data.get('sharesOutstanding'))
         operation = UpdateOne(
             {'ticker': ticker},
@@ -427,7 +463,7 @@ def process_ticker(ticker: str, provider_fn, request_pause: float = 0) -> tuple[
         else:
             if request_pause > 0:
                 time.sleep(request_pause)
-            get_price_history(ticker)
+            get_price_history(ticker, crypto=crypto)
         return ticker, operation, None
     except Exception as e:
         return ticker, None, str(e)
@@ -511,15 +547,19 @@ def run_task(provider_fn, provider_key: str):
             except Exception as e:
                 print(f"[{i}/{total}] Exception processing {ticker}: {e}")
 
+    written = True
     if updates:
         try:
             print(f"Writing {len(updates)} updates to 'marketData' collection...")
             result = collection.bulk_write(updates)
             print(f"Bulk write result: Matched={result.matched_count}, Modified={result.modified_count}, Upserted={result.upserted_count}")
         except Exception as e:
-            print(f"Error during bulk update: {e}")
+            # The queue is the only record of what still needs fetching — emptying it
+            # after a failed write would lose those tickers until their next transaction.
+            written = False
+            print(f"Error during bulk update: {e} — leaving the queue as is for the next run")
 
-    if deletes:
+    if deletes and written:
         try:
             print(f"Removing {len(deletes)} processed tickers from 'tickers' queue...")
             result = tickers_collection.bulk_write(deletes)
@@ -561,9 +601,16 @@ def is_crypto_ticker(ticker: str) -> bool:
     return holdings_collection.find_one({'ticker': ticker, 'assetType': 'CRYPTO'}) is not None
 
 
-def yahoo_crypto_symbol(ticker: str) -> str:
-    """yfinance needs pair form for crypto: 'BTC' -> 'BTC-USD'; 'BTC-EUR' and stocks pass through."""
-    if is_crypto_ticker(ticker) and '-' not in ticker:
+def yahoo_crypto_symbol(ticker: str, crypto: bool | None = None) -> str:
+    """
+    yfinance needs pair form for crypto: 'BTC' -> 'BTC-USD'; 'BTC-EUR' and stocks pass through.
+    `crypto` skips the holdings lookup when the caller already knows — on a coin's first
+    transaction there is no holding to find, and the bare symbol is often a real stock
+    (BTC is Grayscale's Bitcoin Mini Trust ETF, SOL is Emeren Group).
+    """
+    if crypto is None:
+        crypto = is_crypto_ticker(ticker)
+    if crypto and '-' not in ticker:
         return f'{ticker}-USD'
     return ticker
 
@@ -586,9 +633,12 @@ def update_auto():
     # Optional assetType in the body wins over the holdings lookup: on the very
     # first transaction of a ticker the holding doesn't exist yet, so
     # is_crypto_ticker() would misroute crypto to Yahoo (blank data).
+    # A batch (no ticker) keys its debounce timer by provider name, so the crypto
+    # branch must not share "auto": the last call inside the 10 s window picks the
+    # provider for the whole queue, and a stock batch would then go to CoinGecko.
     data = request.get_json(silent=True) or {}
     if str(data.get('assetType') or '').upper() == 'CRYPTO':
-        return _handle_update("auto", crypto_provider.fetch_market_data)
+        return _handle_update("crypto", crypto_provider.fetch_market_data)
     return _handle_update("auto", auto_fetch_market_data)
 
 
@@ -645,14 +695,15 @@ def _finite(value):
     return number if math.isfinite(number) else None
 
 
-def get_price_history(ticker: str, hist=None) -> bool:
+def get_price_history(ticker: str, hist=None, crypto: bool | None = None) -> bool:
     """
     Store full daily price history in MongoDB. Fetches from yfinance unless a
-    pre-downloaded history DataFrame is passed in. Returns True on success.
+    pre-downloaded history DataFrame is passed in. `crypto` as in yahoo_crypto_symbol.
+    Returns True on success.
     """
     try:
         if hist is None:
-            stock = yf.Ticker(yahoo_crypto_symbol(ticker))
+            stock = yf.Ticker(yahoo_crypto_symbol(ticker, crypto))
             hist = stock.history(period='max', auto_adjust=False)
         if hist.empty:
             return False
@@ -789,12 +840,20 @@ def update_statistics():
         return jsonify({'status': 'no_data', 'ticker': ticker,
                         'reason': 'provider returned no statistics fields'}), 200
 
-    update = {'statistics': stats, 'ticker': ticker, 'updatedAt': datetime.now()}
+    # No top-level updatedAt: that stamp says when the *price* was refreshed (the
+    # staleness checks read it), and this path does not touch the price — statistics
+    # carry their own updatedAt. No upsert either: a doc holding statistics but no
+    # price or name is the same stub an unknown symbol used to leave behind.
+    update = {'statistics': stats}
     shares = get_shares_with_fallback(ticker, info)
     if shares:
         update['sharesOutstanding'] = shares
+    result = collection.update_one({'ticker': ticker}, {'$set': update})
+    if result.matched_count == 0:
+        return jsonify({'status': 'no_data', 'ticker': ticker,
+                        'reason': 'no marketData doc for this ticker — run a full update first'}), 200
+    if shares:
         record_shares_history(ticker, shares)
-    collection.update_one({'ticker': ticker}, {'$set': update}, upsert=True)
     return jsonify({'status': 'success', 'ticker': ticker, 'fields': len(stats)}), 200
 
 
@@ -1184,9 +1243,13 @@ def _record_throttled_failure(ticker: str, stage: str, error: str, position: str
 
 def run_throttled_task(ticker_symbols: list[str], pause_seconds: float, scope: str = 'queue'):
     """
-    Sequential Yahoo update of the given tickers, sleeping between them to stay
-    under rate limits. Each ticker is written to marketData and removed from the
-    queue immediately, so an interrupted run loses nothing.
+    Sequential update of the given tickers, sleeping between them to stay under
+    rate limits. Each ticker is written to marketData and removed from the queue
+    immediately, so an interrupted run loses nothing.
+
+    Crypto goes to CoinGecko, same as /update/auto: Yahoo's .info carries no
+    currentPrice for a crypto pair, so a Yahoo pass refreshed a coin's name and
+    previous close but left its price where it was.
 
     Pause and cancel are both checked between tickers only: the ticker in flight
     is always finished and written first.
@@ -1235,10 +1298,13 @@ def run_throttled_task(ticker_symbols: list[str], pause_seconds: float, scope: s
             with throttled_lock:
                 throttled_status["currentTicker"] = ticker
                 throttled_status["currentStage"] = "fetching"
-            throttled_event('info', f"[{position}] {ticker}: fetching from Yahoo", ticker)
+            crypto = is_crypto_ticker(ticker)
+            fetch = crypto_provider.fetch_market_data if crypto else throttled_yahoo_fetch
+            throttled_event('info', f"[{position}] {ticker}: fetching from "
+                                    f"{'CoinGecko' if crypto else 'Yahoo'}", ticker)
 
             processed_ticker, operation, error = process_ticker(
-                ticker, throttled_yahoo_fetch, request_pause=pause_seconds)
+                ticker, fetch, request_pause=pause_seconds)
 
             if operation:
                 with throttled_lock:
@@ -1267,7 +1333,8 @@ def run_throttled_task(ticker_symbols: list[str], pause_seconds: float, scope: s
         throttled_event('err', f"Run crashed: {e}")
     finally:
         with throttled_lock:
-            if throttled_status["cancelRequested"]:
+            # never clobber a crash reason — that is the one that needs reading
+            if throttled_status["cancelRequested"] and not throttled_status["abortedReason"]:
                 throttled_status["abortedReason"] = "cancelled by user"
             processed, total_final = throttled_status["processed"], throttled_status["total"]
             aborted = throttled_status["abortedReason"]
@@ -1936,11 +2003,19 @@ document.getElementById('scopeSeg').addEventListener('click', function (e) {
   [].forEach.call(this.querySelectorAll('button'), function (x) { x.classList.toggle('on', x === b); });
 });
 
+// Log lines and progress text carry server strings (exception messages, tickers the
+// user typed) — escaped, so one containing markup renders as text instead of HTML.
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+  });
+}
+
 function log(msg, kind) {
   var el = document.getElementById('log');
   var d = document.createElement('div');
   var t = new Date().toTimeString().slice(0, 8);
-  d.innerHTML = '<span class="t">' + t + '</span><span class="' + (kind || '') + '">' + msg + '</span>';
+  d.innerHTML = '<span class="t">' + t + '</span><span class="' + (kind || '') + '">' + esc(msg) + '</span>';
   el.insertBefore(d, el.firstChild);
   while (el.childNodes.length > 200) el.removeChild(el.lastChild);
 }
@@ -2061,12 +2136,12 @@ function renderProgress(barId, progId, s, extra) {
   if (s.running) txt = '<b>' + s.processed + '/' + s.total + '</b> (' + pct + '%)';
   else if (s.finishedAt) txt = 'finished <b>' + s.processed + '/' + s.total + '</b>';
   else txt = 'idle';
-  if (s.currentTicker) txt += ' &middot; ' + s.currentTicker + (s.currentStage ? ' (' + s.currentStage + ')' : '');
+  if (s.currentTicker) txt += ' &middot; ' + esc(s.currentTicker) + (s.currentStage ? ' (' + esc(s.currentStage) + ')' : '');
   if (extra) txt += extra;
   if (s.paused) txt += ' &middot; <span class="warn">paused</span>';
   if (s.cancelRequested) txt += ' &middot; <span class="warn">stopping after current ticker\\u2026</span>';
   if (s.failed && s.failed.length) txt += ' &middot; <span class="err">' + s.failed.length + ' failed</span>';
-  if (s.abortedReason) txt += ' &middot; <span class="err">aborted: ' + s.abortedReason + '</span>';
+  if (s.abortedReason) txt += ' &middot; <span class="err">aborted: ' + esc(s.abortedReason) + '</span>';
   document.getElementById(progId).innerHTML = '<span class="' + dot + '"></span>' + txt;
 }
 

@@ -98,11 +98,11 @@ _SHARES_FALLBACK_CONCEPTS = [
 _SHARES_SPARSE_BELOW = 8
 _SHARES_STALE_DAYS = 730
 
-# Curated fundamentals: one internal key -> ordered list of (taxonomy, tag)
-# candidates, since filers drift which exact tag they use across years (e.g.
-# revenue recognition tags changed industry-wide around ASC 606 in 2018).
-# First candidate that has data wins; a company that never tagged any of a
-# key's candidates simply omits that key from the result.
+# Curated fundamentals: one internal key -> list of (taxonomy, tag) candidates,
+# since filers drift which exact tag they use across years (e.g. revenue
+# recognition tags changed industry-wide around ASC 606 in 2018). Every
+# candidate is fetched and merged by date (see fetch_fundamentals); a company
+# that never tagged any of a key's candidates simply omits that key.
 FUNDAMENTAL_CONCEPTS = {
     'assets':               [('us-gaap', 'Assets')],
     'liabilities':          [('us-gaap', 'Liabilities')],
@@ -246,6 +246,14 @@ def fetch_fundamentals(ticker: str) -> dict:
     cover a different date range for the same company. Picking only the first
     non-empty candidate silently truncates the series to whichever tag was
     tried first, even though a later tag would extend it with recent years.
+
+    Duration concepts (revenue, income, EPS, R&D, buybacks, dividends) take the
+    shortest period on a shared end date: a 10-Q reports the quarter and the
+    year-to-date figure with the same 'end', and Q4 shares 12-31 with the fiscal
+    year, so deduping on the date alone mixed 3-, 6-, 9- and 12-month values into
+    one series. Instant concepts (assets, cash, debt) have no period and are
+    unaffected. A filer that tags no standalone Q4 still leaves its fiscal-year
+    figure on that date — SEC has no other value for it.
     """
     cik = get_cik(ticker)
     if not cik:
@@ -256,7 +264,7 @@ def fetch_fundamentals(ticker: str) -> dict:
         by_date: dict[str, dict] = {}
         filed_by_date: dict[str, str] = {}
         for taxonomy, tag in tag_candidates:
-            series = _fetch_concept_series(cik, taxonomy, tag)
+            series = _fetch_concept_series(cik, taxonomy, tag, prefer_shortest_period=True)
             if not series:
                 continue
             for entry in series:

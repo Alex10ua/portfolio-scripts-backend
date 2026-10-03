@@ -109,6 +109,28 @@ class TestGetStatistics(unittest.TestCase):
         stats = utils.get_statistics({'beta': 1.0}, 'X')
         self.assertRegex(stats['updatedAt'], r'^\d{4}-\d{2}-\d{2}$')
 
+    def test_non_finite_values_dropped(self):
+        # UKW.L came back with trailingPE = Infinity; the Java BigDecimal field
+        # cannot hold it and the whole marketData doc stopped mapping
+        stats = utils.get_statistics({
+            'trailingPE': float('inf'), 'forwardPE': 'Infinity', 'pegRatio': float('nan'),
+            'marketCap': float('inf'), 'beta': 1.1,
+        }, 'X')
+        self.assertEqual(list(k for k in stats if k != 'updatedAt'), ['beta'])
+
+
+class TestCurrentPrice(unittest.TestCase):
+
+    def test_equity_uses_current_price(self):
+        self.assertEqual(utils.get_current_price({'currentPrice': 101.5, 'regularMarketPrice': 101.4}, 'X'), 101.5)
+
+    def test_etf_and_crypto_fall_back_to_regular_market_price(self):
+        # Yahoo omits currentPrice for ETFs and crypto pairs (checked SPY, ETH-USD)
+        self.assertEqual(utils.get_current_price({'currentPrice': None, 'regularMarketPrice': 2672.13}, 'ETH'), 2672.13)
+
+    def test_no_price_at_all_is_blank(self):
+        self.assertEqual(utils.get_current_price({}, 'X'), '')
+
     def test_field_spec_keys_are_unique(self):
         out_keys = [f[0] for f in utils.STATISTICS_FIELDS]
         self.assertEqual(len(out_keys), len(set(out_keys)))

@@ -1,10 +1,21 @@
+import importlib.util
 import io
+import os
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 
 import corporate_actions
-import updateMarketDataUtilities
+
+# Loaded from the file, not imported: test_update_logic.py puts a MagicMock under
+# 'updateMarketDataUtilities' in sys.modules at import time, so in a combined run
+# a plain import hands get_splits back as a mock (see test_statistics.py).
+_spec = importlib.util.spec_from_file_location(
+    'updateMarketDataUtilities_corporate_actions',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'updateMarketDataUtilities.py'),
+)
+updateMarketDataUtilities = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(updateMarketDataUtilities)
 
 
 class _Timestamp(datetime):

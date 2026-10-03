@@ -69,4 +69,8 @@ def fetch_market_data(ticker: str) -> dict:
         'industry': 'Cryptocurrency',
         'sharesOutstanding': int(supply) if supply else None,  # circulating supply
         'updatedAt': datetime.now(),
+        # Popped by process_ticker, never stored: the price history still comes from
+        # Yahoo, and on a coin's first transaction there is no CRYPTO holding yet to
+        # tell yahoo_crypto_symbol to ask for the -USD pair instead of a same-named stock.
+        '_crypto': True,
     }

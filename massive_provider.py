@@ -29,14 +29,19 @@ def _map_response(ticker: str, data: dict) -> dict:
     raw_dividends = data.get('dividends') or []
     raw_splits = data.get('splits') or []
 
+    # Incomplete entries are dropped, not blank-filled: process_ticker only strips ''
+    # from top-level fields, so a '' amount or ratio inside a list reached Mongo and
+    # read back as a null dividend or split on the Java side.
     dividends = [
-        {'dividendDate': d.get('dividendDate', ''), 'dividendAmount': d.get('dividendAmount', '')}
+        {'dividendDate': d['dividendDate'], 'dividendAmount': d['dividendAmount']}
         for d in raw_dividends
+        if isinstance(d, dict) and d.get('dividendDate') and d.get('dividendAmount') not in (None, '')
     ] if isinstance(raw_dividends, list) else []
 
     splits = [
-        {'splitDate': s.get('splitDate', ''), 'ratioSplit': s.get('ratioSplit', '')}
+        {'splitDate': s['splitDate'], 'ratioSplit': s['ratioSplit']}
         for s in raw_splits
+        if isinstance(s, dict) and s.get('splitDate') and s.get('ratioSplit') not in (None, '')
     ] if isinstance(raw_splits, list) else []
 
     return {

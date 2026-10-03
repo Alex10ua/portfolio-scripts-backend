@@ -7,9 +7,6 @@ ECB_URL = (
     "?lastNObservations=1&format=jsondata"
 )
 
-# ECB series key order: currency codes in the URL above
-_CURRENCIES = ["USD", "GBP", "CHF", "PLN", "CZK"]
-
 
 def fetch_and_store_rates(db) -> dict:
     """Fetch latest ECB FX rates and upsert into the exchangeRates collection.
@@ -23,6 +20,10 @@ def fetch_and_store_rates(db) -> dict:
 
     data = response.json()
     rates = _parse_ecb_response(data)
+    if not rates:
+        # Storing EUR alone and answering 'ok' is how a broken parse went unnoticed:
+        # every missing currency silently converts at 1.0 downstream.
+        raise RuntimeError("ECB response carried no parsable rates")
 
     # Always include EUR itself
     rates["EUR"] = 1.0
@@ -47,24 +48,31 @@ def fetch_and_store_rates(db) -> dict:
 
 
 def _parse_ecb_response(data: dict) -> dict:
-    """Extract currency -> rateVsEur from ECB SDMX-JSON response."""
+    """
+    Extract currency -> rateVsEur from an ECB SDMX-JSON response.
+
+    A series key such as "0:3:0:0:0" holds one index per series dimension, in the
+    order structure.dimensions.series lists them — FREQ, CURRENCY, CURRENCY_DENOM,
+    EXR_TYPE, EXR_SUFFIX — and each index points into that dimension's own `values`
+    list. So the currency is neither the key's first position (that is FREQ, always
+    0 for a daily query) nor the order the URL asked for: the ECB lists the values
+    alphabetically (CHF, CZK, GBP, PLN, USD). Reading position 0 mapped every
+    series onto one currency, and only USD was ever stored.
+    """
     rates = {}
     try:
-        series = data["dataSets"][0]["series"]
-        # series keys are like "0:0:0:0:0", "1:0:0:0:0" — first index = currency position
-        for key, series_data in series.items():
-            currency_idx = int(key.split(":")[0])
-            if currency_idx >= len(_CURRENCIES):
-                continue
-            currency = _CURRENCIES[currency_idx]
-            observations = series_data.get("observations", {})
+        dimensions = data["structure"]["dimensions"]["series"]
+        position = next(i for i, dim in enumerate(dimensions) if dim.get("id") == "CURRENCY")
+        codes = [value["id"] for value in dimensions[position]["values"]]
+        for key, series_data in data["dataSets"][0]["series"].items():
+            currency = codes[int(key.split(":")[position])]
+            observations = series_data.get("observations") or {}
             if not observations:
                 continue
             # Last observation value
-            last_obs = observations[max(observations.keys(), key=int)]
-            rate = last_obs[0]
+            rate = observations[max(observations, key=int)][0]
             if rate is not None:
                 rates[currency] = float(rate)
-    except (KeyError, IndexError, TypeError) as e:
+    except (KeyError, IndexError, TypeError, ValueError, StopIteration) as e:
         print(f"[ecb_provider] Parse error: {e}")
     return rates

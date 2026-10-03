@@ -121,5 +121,33 @@ class TestSharesHistory(unittest.TestCase):
         self.assertEqual([e['value'] for e in result], [900])
 
 
+class TestFundamentalsPeriods(unittest.TestCase):
+
+    def setUp(self):
+        sec._cik_map_cache = {'MSFT': '0000789019'}
+
+    def test_quarter_beats_year_to_date_on_a_shared_end_date(self):
+        """A 10-Q files the quarter and the half-year with one 'end' and one 'filed'."""
+        revenue = {'units': {'USD': [
+            _duration('2025-01-01', '2025-06-30', 200, filed='2025-07-30'),   # 6-month YTD
+            _duration('2025-04-01', '2025-06-30', 110, filed='2025-07-30'),   # Q2
+            _duration('2024-07-01', '2025-06-30', 400, filed='2025-07-30'),   # trailing year
+        ]}}
+        stub = MagicMock(side_effect=_router({'Revenues': revenue}))
+        with patch.object(sec, '_MIN_INTERVAL', 0), patch.object(sec.requests, 'get', stub):
+            result = sec.fetch_fundamentals('MSFT')
+        self.assertEqual([e['value'] for e in result['revenue']], [110])
+
+    def test_instant_concepts_still_take_the_latest_filing(self):
+        assets = {'units': {'USD': [
+            _instant('2025-06-30', 1_000, filed='2025-07-30'),
+            _instant('2025-06-30', 1_050, filed='2026-01-30'),   # restated
+        ]}}
+        stub = MagicMock(side_effect=_router({'Assets': assets}))
+        with patch.object(sec, '_MIN_INTERVAL', 0), patch.object(sec.requests, 'get', stub):
+            result = sec.fetch_fundamentals('MSFT')
+        self.assertEqual([e['value'] for e in result['assets']], [1_050])
+
+
 if __name__ == '__main__':
     unittest.main()

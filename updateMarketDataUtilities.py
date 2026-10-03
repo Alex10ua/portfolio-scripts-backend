@@ -1,3 +1,4 @@
+import math
 from datetime import datetime, timezone
 
 import corporate_actions
@@ -28,8 +29,12 @@ def get_company_name(stock_info, ticker):
     return name
 
 def get_current_price(stock_info, ticker):
+    # currentPrice comes from Yahoo's financialData module, which only equities have.
+    # ETFs and crypto pairs carry regularMarketPrice alone — without the fallback
+    # their price was never refreshed while previousClose was, so the day's change
+    # compared a months-old price with yesterday's close.
     try:
-        price = stock_info.get('currentPrice') or ''
+        price = stock_info.get('currentPrice') or stock_info.get('regularMarketPrice') or ''
     except Exception as e:
         print(f"Error getting current price for {ticker}: {e}")
         price = None
@@ -56,7 +61,7 @@ def action_day(value) -> str:
     stored as the day, not as a moment in time.
 
     A string is what the daily price series already writes ('date': str(idx.date()))
-    and what the Finnhub and Massive providers already produce, so this brings the
+    and what the Massive provider already produces, so this brings the
     Yahoo path in line rather than inventing a third representation. Spring reads
     it into the LocalDate on Dividend/Splits through StringToLocalDateConverter,
     which takes a full ISO date (see the 'YYYY-MM' note in CLAUDE.md for the shape
@@ -261,7 +266,12 @@ def _epoch_to_date(value):
 
 def _coerce_statistic(value, kind):
     """None means 'no usable value' — the caller drops the key entirely rather
-    than writing a null over whatever the previous update stored."""
+    than writing a null over whatever the previous update stored.
+
+    Non-finite numbers count as no value. Yahoo reports e.g. trailingPE as
+    Infinity when earnings are zero, and the Java side maps these fields to
+    BigDecimal, which has no Infinity or NaN — one such value makes the whole
+    marketData document unreadable, not just the field."""
     if value is None or value == '' or isinstance(value, bool):
         return None
     if kind == 'str':
@@ -269,9 +279,12 @@ def _coerce_statistic(value, kind):
         return text or None
     if kind == 'date':
         return _epoch_to_date(value)
+    number = float(value)
+    if not math.isfinite(number):
+        return None
     if kind == 'int':
-        return int(float(value))
-    return float(value)
+        return int(number)
+    return number
 
 
 def get_statistics(stock_info, ticker):

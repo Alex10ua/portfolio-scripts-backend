@@ -85,14 +85,91 @@ class TestUpdateMarketData(unittest.TestCase):
         mock_executor.submit.side_effect = [f1, f2]
 
         provider = self._make_mock_provider()
-        with patch('concurrent.futures.as_completed', return_value=[f1, f2]):
+        # Mocked pymongo hands back one MagicMock for every collection, so without
+        # this the queue cursor doubles as customAssets and every ticker is skipped.
+        with patch.object(updateMarketData, 'get_custom_tickers', return_value=set()), \
+             patch('concurrent.futures.as_completed', return_value=[f1, f2]):
             updateMarketData.run_task(provider, 'yahoo')
 
-        self.assertTrue(updateMarketData.collection.bulk_write.called)
-        self.assertTrue(updateMarketData.tickers_collection.bulk_write.called)
-
-        args, _ = updateMarketData.collection.bulk_write.call_args
+        # marketData write, then the queue delete (one mock serves both collections)
+        self.assertEqual(updateMarketData.collection.bulk_write.call_count, 2)
+        args, _ = updateMarketData.collection.bulk_write.call_args_list[0]
         self.assertEqual(len(args[0]), 2)
+
+    @patch('concurrent.futures.ThreadPoolExecutor')
+    def test_run_task_keeps_queue_when_write_fails(self, mock_executor_cls):
+        updateMarketData.tickers_collection.find.return_value = [{'ticker': 'AAPL'}]
+        updateMarketData.collection.bulk_write.side_effect = Exception('mongo down')
+        mock_executor = MagicMock()
+        mock_executor_cls.return_value.__enter__.return_value = mock_executor
+        f1 = MagicMock()
+        f1.result.return_value = ('AAPL', MagicMock(), None)
+        mock_executor.submit.side_effect = [f1]
+
+        with patch.object(updateMarketData, 'get_custom_tickers', return_value=set()), \
+             patch('concurrent.futures.as_completed', return_value=[f1]):
+            updateMarketData.run_task(self._make_mock_provider(), 'yahoo')
+
+        # the failed marketData write only — no queue delete after it
+        self.assertEqual(updateMarketData.collection.bulk_write.call_count, 1)
+
+    def _set_of(self, ticker, provider):
+        """The $set document process_ticker built for `ticker`."""
+        with patch.object(updateMarketData, 'UpdateOne') as update_one, \
+             patch.object(updateMarketData, 'get_price_history') as history:
+            _, op, error = updateMarketData.process_ticker(ticker, provider)
+        self.assertIsNone(error)
+        return update_one.call_args.args[1]['$set'], history
+
+    def test_unknown_symbol_is_a_failure_not_a_stub(self):
+        # Yahoo's answer to a symbol it does not know: empty .info, empty history
+        def provider(ticker):
+            return {'name': '', 'price': '', 'priceYesterday': None, 'currency': None,
+                    'dividends': [], 'splits': [], 'updatedAt': 'now'}
+
+        with patch.object(updateMarketData, 'UpdateOne') as update_one:
+            ticker, op, error = updateMarketData.process_ticker('UKW.GB', provider)
+        self.assertIsNone(op)
+        self.assertIn('no price and no name', error)
+        update_one.assert_not_called()
+
+    def test_missing_price_drops_previous_close_and_freshness_stamp(self):
+        def provider(ticker):
+            return {'name': 'Ethereum USD', 'price': '', 'priceYesterday': 2775.96,
+                    'dividends': [], 'splits': [], 'updatedAt': 'now'}
+
+        updateMarketData.collection.find_one.return_value = None
+        fields, _ = self._set_of('ETH', provider)
+        self.assertEqual(fields['name'], 'Ethereum USD')
+        self.assertNotIn('priceYesterday', fields)
+        self.assertNotIn('updatedAt', fields)
+
+    def test_stored_ignored_split_is_purged(self):
+        from datetime import datetime
+        updateMarketData.collection.find_one.return_value = {'splits': [
+            {'splitDate': '2005-05-18', 'ratioSplit': 2.0},
+            # SPGI's spin-off, stored before ignored_splits.json listed it — legacy
+            # instant form, 04:00Z being New York midnight
+            {'splitDate': datetime(2026, 7, 1, 4, 0), 'ratioSplit': 1.057},
+        ]}
+        fields, _ = self._set_of('SPGI', self._make_mock_provider())
+        self.assertEqual([s['ratioSplit'] for s in fields['splits']], [2.0])
+
+    def test_crypto_provider_history_uses_the_pair_symbol(self):
+        def provider(ticker):
+            return {'name': 'Bitcoin', 'price': 65000.0, 'dividends': [], 'splits': [], '_crypto': True}
+
+        updateMarketData.collection.find_one.return_value = None
+        fields, history = self._set_of('BTC', provider)
+        self.assertNotIn('_crypto', fields)
+        history.assert_called_once_with('BTC', crypto=True)
+
+    def test_yahoo_symbol_when_crypto_is_known(self):
+        updateMarketData.holdings_collection.find_one.reset_mock()
+        self.assertEqual(updateMarketData.yahoo_crypto_symbol('BTC', crypto=True), 'BTC-USD')
+        self.assertEqual(updateMarketData.yahoo_crypto_symbol('BTC-EUR', crypto=True), 'BTC-EUR')
+        self.assertEqual(updateMarketData.yahoo_crypto_symbol('AAPL', crypto=False), 'AAPL')
+        updateMarketData.holdings_collection.find_one.assert_not_called()
 
     def test_schedule_batch_yahoo_timer(self):
         provider = self._make_mock_provider()
@@ -338,6 +415,8 @@ class TestThrottledRun(unittest.TestCase):
         self.threading = threading
         updateMarketData.collection.reset_mock(side_effect=True, return_value=True)
         updateMarketData.tickers_collection.reset_mock(side_effect=True, return_value=True)
+        # no holding at all — a bare MagicMock would read as a CRYPTO holding
+        updateMarketData.holdings_collection.find_one.return_value = None
         with updateMarketData.throttled_lock:
             updateMarketData.throttled_status.update({
                 "running": False, "scope": None, "total": 0, "processed": 0,
@@ -492,6 +571,37 @@ class TestThrottledRun(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertTrue(all(e['seq'] > cutoff for e in body['events']))
         self.assertEqual(body['eventSeq'], seqs[-1])
+
+    def test_crypto_goes_to_coingecko_not_yahoo(self):
+        # Yahoo's .info has no currentPrice for a crypto pair: a Yahoo pass left
+        # ETH's price stale while refreshing its previous close
+        updateMarketData.holdings_collection.find_one.side_effect = (
+            lambda query, *a, **k: {'ticker': 'ETH'} if query.get('ticker') == 'ETH' else None)
+        used = {}
+
+        def fake_process(ticker, provider_fn, request_pause=0):
+            used[ticker] = provider_fn
+            return ticker, MagicMock(), None
+
+        with patch.object(updateMarketData, 'process_ticker', side_effect=fake_process):
+            self._start(['AAPL', 'ETH']).join(timeout=5)
+
+        self.assertIs(used['ETH'], updateMarketData.crypto_provider.fetch_market_data)
+        self.assertIsNot(used['AAPL'], updateMarketData.crypto_provider.fetch_market_data)
+        messages = ' | '.join(e['message'] for e in self._status('events'))
+        self.assertIn('ETH: fetching from CoinGecko', messages)
+        self.assertIn('AAPL: fetching from Yahoo', messages)
+
+    def test_cancel_does_not_clobber_a_crash_reason(self):
+        def boom(ticker, provider_fn, request_pause=0):
+            with updateMarketData.throttled_lock:
+                updateMarketData.throttled_status["cancelRequested"] = True
+            raise RuntimeError('worker exploded')
+
+        with patch.object(updateMarketData, 'process_ticker', side_effect=boom):
+            self._start(['AAPL']).join(timeout=5)
+
+        self.assertIn('worker exploded', self._status('abortedReason'))
 
     def test_event_feed_is_capped(self):
         with updateMarketData.throttled_lock:
