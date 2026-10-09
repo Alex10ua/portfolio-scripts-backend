@@ -613,5 +613,87 @@ class TestThrottledRun(unittest.TestCase):
         self.assertEqual(events[-1]['message'], f'line {updateMarketData.THROTTLED_EVENT_CAP + 24}')
 
 
+class TestBulkRun(unittest.TestCase):
+    """
+    POST /update/bulk's worker: per-ticker outcomes land in the right counter, and
+    the run stops on a provider rate limit or a streak of failures instead of
+    pushing on. Run inline with pauseSeconds=0 and a fake job.
+    """
+
+    def setUp(self):
+        with updateMarketData.bulk_lock:
+            updateMarketData.bulk_status.update({
+                "running": True, "job": None, "total": 0, "processed": 0, "updated": 0,
+                "noData": [], "failed": [], "cancelRequested": False, "abortedReason": None,
+                "events": [],
+            })
+
+    def _run(self, outcomes: dict, tickers: list):
+        calls = []
+
+        def fake_job(ticker):
+            calls.append(ticker)
+            return outcomes.get(ticker, ('success', {'fields': 3}))
+
+        with patch.dict(updateMarketData.BULK_JOBS, {'fake': (fake_job, 'fake job', 'yahoo')}):
+            updateMarketData.run_bulk_task('fake', tickers, 0, 'holdings')
+        return calls
+
+    def _status(self, key):
+        with updateMarketData.bulk_lock:
+            return updateMarketData.bulk_status[key]
+
+    def test_outcomes_counted_per_kind(self):
+        calls = self._run({
+            'ETF': ('no_data', {'reason': 'ETF has no financial statements'}),
+            'BAD': ('error', {'error': 'Yahoo said no'}),
+        }, ['AAPL', 'ETF', 'BAD', 'MSFT'])
+
+        self.assertEqual(calls, ['AAPL', 'ETF', 'BAD', 'MSFT'])
+        self.assertEqual(self._status('processed'), 4)
+        self.assertEqual(self._status('updated'), 2)
+        self.assertEqual(self._status('noData'), ['ETF'])
+        failed = self._status('failed')
+        self.assertEqual([(f['ticker'], f['stage'], f['error']) for f in failed], [('BAD', 'error', 'Yahoo said no')])
+        self.assertIsNone(self._status('abortedReason'))
+        self.assertFalse(self._status('running'))
+
+    def test_rate_limit_stops_the_run(self):
+        calls = self._run({'B': ('rate_limited', {'error': 'SEC 429'})}, ['A', 'B', 'C'])
+        self.assertEqual(calls, ['A', 'B'])
+        self.assertIn('rate-limited at B', self._status('abortedReason'))
+
+    def test_failure_streak_stops_the_run(self):
+        n = updateMarketData.BULK_MAX_CONSECUTIVE_FAILURES
+        tickers = [f'T{i}' for i in range(n + 3)]
+        calls = self._run({t: ('error', {'error': 'timeout'}) for t in tickers}, tickers)
+        self.assertEqual(len(calls), n)
+        self.assertIn('failures in a row', self._status('abortedReason'))
+
+    def test_success_or_no_data_resets_the_streak(self):
+        n = updateMarketData.BULK_MAX_CONSECUTIVE_FAILURES
+        bad = ('error', {'error': 'timeout'})
+        # n-1 failures, a no_data, n-1 failures: never n in a row
+        tickers = [f'E{i}' for i in range(n - 1)] + ['ND'] + [f'F{i}' for i in range(n - 1)]
+        outcomes = {t: bad for t in tickers}
+        outcomes['ND'] = ('no_data', {'reason': 'none'})
+        calls = self._run(outcomes, tickers)
+        self.assertEqual(len(calls), len(tickers))
+        self.assertIsNone(self._status('abortedReason'))
+
+    def test_cancel_ends_after_the_ticker_in_flight(self):
+        def fake_job(ticker):
+            with updateMarketData.bulk_lock:
+                updateMarketData.bulk_status["cancelRequested"] = True
+            return 'success', {}
+
+        with patch.dict(updateMarketData.BULK_JOBS, {'fake': (fake_job, 'fake job', 'yahoo')}):
+            updateMarketData.run_bulk_task('fake', ['A', 'B', 'C'], 0, 'all')
+
+        self.assertEqual(self._status('processed'), 1)
+        self.assertEqual(self._status('abortedReason'), 'cancelled by user')
+        self.assertFalse(self._status('cancelRequested'))
+
+
 if __name__ == '__main__':
     unittest.main()

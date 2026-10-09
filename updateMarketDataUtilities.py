@@ -160,6 +160,11 @@ STATISTICS_FIELDS = [
     # Fiscal year
     ('fiscalYearEnd', 'lastFiscalYearEnd', 'date'),
     ('mostRecentQuarter', 'mostRecentQuarter', 'date'),
+    # Currency of every income-statement / balance-sheet / cash-flow figure below.
+    # NOT the quote currency: Unilever (ULVR.L) is quoted in GBp and reports in EUR,
+    # TSM trades in USD and reports in TWD. Per-share prices and ratios aside,
+    # dividing a statement figure by the price only works after converting this.
+    ('financialCurrency', 'financialCurrency', 'str'),
 
     # Profitability
     ('profitMargin', 'profitMargins', 'num'),
@@ -308,3 +313,36 @@ def get_statistics(stock_info, ticker):
         return None
     stats['updatedAt'] = datetime.now().strftime('%Y-%m-%d')
     return stats
+
+
+# ---------- Financial statements (Yahoo timeseries -> yahooFinancials) ----------
+
+def statement_series(frame) -> dict:
+    """
+    {line item: [{date, value}, ...]} from a yfinance statement frame, dates
+    ascending. The frame has one row per line item (TotalRevenue, GrossProfit,
+    FreeCashFlow, ...) and one column per period end.
+
+    Every line item Yahoo returned is kept, not a curated subset. Missing values
+    are dropped, never stored as zero, and so are non-finite ones: Yahoo pads the
+    oldest column with NaN, and the Java side reads these values as BigDecimal,
+    which has no NaN. A line item with no value left is omitted entirely.
+    """
+    series = {}
+    if frame is None or getattr(frame, 'empty', True):
+        return series
+    for item, row in frame.iterrows():
+        entries = []
+        for period_end, value in row.items():
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(number):
+                continue
+            entries.append({'date': action_day(period_end), 'value': number})
+        if entries:
+            entries.sort(key=lambda e: e['date'])
+            # Mongo field names must not carry '.' (Spring cannot map them back)
+            series[str(item).replace('.', '_')] = entries
+    return series

@@ -171,6 +171,53 @@ class TestActionDay(unittest.TestCase):
             [{'splitDate': '2018-05-03', 'ratioSplit': 2.0}])
 
 
+class TestFinancialCurrency(unittest.TestCase):
+
+    def test_reporting_currency_stored_apart_from_quote_currency(self):
+        # ULVR.L: quoted in GBp, reports in EUR — a per-share figure off the
+        # statements is in EUR, and only financialCurrency says so
+        stats = utils.get_statistics({'currency': 'GBp', 'financialCurrency': 'EUR', 'beta': 0.3}, 'ULVR.L')
+        self.assertEqual(stats['financialCurrency'], 'EUR')
+
+
+class TestStatementSeries(unittest.TestCase):
+    """yfinance statement frame (rows = line items, columns = period ends) ->
+    {item: [{date, value}]} for the yahooFinancials collection."""
+
+    def test_every_line_item_kept_dates_ascending(self):
+        from datetime import datetime
+        frame = _Frame({
+            'TotalRevenue': {datetime(2026, 6, 30): 331839000000.0, datetime(2025, 6, 30): 281724000000.0},
+            'DilutedEPS': {datetime(2026, 6, 30): 17.95, datetime(2025, 6, 30): 13.64},
+        })
+        series = utils.statement_series(frame)
+        self.assertEqual(series['TotalRevenue'], [
+            {'date': '2025-06-30', 'value': 281724000000.0},
+            {'date': '2026-06-30', 'value': 331839000000.0},
+        ])
+        self.assertEqual([e['value'] for e in series['DilutedEPS']], [13.64, 17.95])
+
+    def test_nan_padding_dropped_and_empty_item_omitted(self):
+        # Yahoo pads the oldest column with NaN; BigDecimal on the Java side has no NaN
+        from datetime import datetime
+        frame = _Frame({
+            'FreeCashFlow': {datetime(2026, 6, 30): 66987000000.0, datetime(2022, 6, 30): float('nan')},
+            'WriteOff': {datetime(2026, 6, 30): float('nan')},
+            'Odd': {datetime(2026, 6, 30): None},
+        })
+        series = utils.statement_series(frame)
+        self.assertEqual(series, {'FreeCashFlow': [{'date': '2026-06-30', 'value': 66987000000.0}]})
+
+    def test_empty_or_missing_frame(self):
+        self.assertEqual(utils.statement_series(None), {})
+        self.assertEqual(utils.statement_series(_Frame({})), {})
+
+    def test_dot_in_item_name_replaced(self):
+        from datetime import datetime
+        series = utils.statement_series(_Frame({'Odd.Item': {datetime(2026, 6, 30): 1.0}}))
+        self.assertIn('Odd_Item', series)
+
+
 class _Series:
     """Just the .items() get_dividends/get_splits use, without pulling in pandas."""
 
@@ -179,6 +226,17 @@ class _Series:
 
     def items(self):
         return self._mapping.items()
+
+
+class _Frame:
+    """Just the .empty / .iterrows() statement_series uses, without pulling in pandas."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.empty = not rows
+
+    def iterrows(self):
+        return ((item, _Series(values)) for item, values in self._rows.items())
 
 
 if __name__ == '__main__':
