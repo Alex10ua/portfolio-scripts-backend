@@ -84,21 +84,28 @@ throttled_status = {
     "eventSeq": 0,
 }
 
-# Bulk SEC EDGAR backfill — one run at a time (see run_sec_bulk_task)
+# Bulk SEC EDGAR backfill — one run at a time (see run_sec_bulk_task). Same shape
+# as bulk_status: both runs go through _run_jobs, in separate slots so a SEC
+# backfill can run beside a Yahoo run.
 sec_bulk_lock = threading.Lock()
 sec_bulk_status = {
     "running": False,
+    "scope": None,   # "holdings" | "all" | "list"
     "total": 0,
     "processed": 0,
-    "fundamentalsUpdated": 0,
-    "sharesUpdated": 0,
+    "updated": 0,
     "noData": [],
+    # {ticker, stage, error, at}; stage is the job status: 'error' | 'rate_limited'
     "failed": [],
+    "pauseSeconds": None,
     "currentTicker": None,
+    "currentStage": None,   # fetching | waiting
     "cancelRequested": False,
     "abortedReason": None,
     "startedAt": None,
     "finishedAt": None,
+    "events": [],
+    "eventSeq": 0,
 }
 
 
@@ -399,9 +406,11 @@ def record_shares_history(ticker: str, shares) -> None:
     """
     Append {date, shares} to the ticker's sharesOutstandingHistory doc, but only
     when the value differs from the last recorded one — a sparse time series of
-    share-count changes (buybacks/dilution; circulating supply for crypto).
-    A second change on the same day replaces that day's entry. Best-effort:
-    never raises, so a history failure can't break the marketData write.
+    supply changes. A second change on the same day replaces that day's entry.
+    Best-effort: never raises, so a history failure can't break the marketData write.
+
+    Callers use it for CRYPTO only (circulating supply, which has no filings).
+    A stock's share-count history is SEC filings alone — see replace_shares_history.
     """
     if not shares:
         return
@@ -426,31 +435,40 @@ def record_shares_history(ticker: str, shares) -> None:
         print(f'[sharesHistory] Error recording {ticker}: {e}')
 
 
-def record_shares_history_bulk(ticker: str, entries: list) -> int:
+def replace_shares_history(ticker: str, entries: list) -> int:
     """
-    Merge a batch of {date, shares} entries (e.g. from SEC EDGAR) into the
-    ticker's history doc — same collection/shape as record_shares_history, but
-    for a whole time series at once. A later-written entry on an existing date
-    overwrites it. Best-effort: never raises. Returns entries stored (0 on
-    no-op/error) so the caller can report what happened.
+    Make the ticker's sharesOutstandingHistory exactly this SEC EDGAR series.
+
+    A stock's share-count history is SEC filings only. This used to MERGE, which
+    kept every live Yahoo snapshot ever recorded beside the filings — counts of a
+    different kind (GOOGL's class-A-only 5.9B next to 12B filed; EL, CWEN) — and
+    every fact an older fetch returned that SEC no longer reports (issued shares
+    from the dropped CommonStockSharesIssued fallback). An empty series deletes
+    the doc: no filings means no history, not whatever snapshots were left.
+
+    Crypto is never touched — its history is circulating supply from
+    record_shares_history, and it has no filings. Best-effort: never raises.
+    Returns entries stored (0 on none/error) so the caller can report it.
     """
-    if not entries:
+    if is_crypto_ticker(ticker):
         return 0
     try:
-        doc = shares_history_collection.find_one({'_id': ticker}, {'history': 1})
-        merged_by_date = {h['date']: h['shares'] for h in (doc or {}).get('history') or [] if h.get('date')}
-        for e in entries:
-            if e.get('date') and e.get('shares') is not None:
-                merged_by_date[e['date']] = int(e['shares'])
-        merged = [{'date': d, 'shares': merged_by_date[d]} for d in sorted(merged_by_date)]
+        series = sorted(
+            ({'date': e['date'], 'shares': int(e['shares'])}
+             for e in entries if e.get('date') and e.get('shares') is not None),
+            key=lambda e: e['date'],
+        )
+        if not series:
+            shares_history_collection.delete_one({'_id': ticker})
+            return 0
         shares_history_collection.update_one(
             {'_id': ticker},
-            {'$set': {'history': merged, 'ticker': ticker, 'lastUpdated': merged[-1]['date']}},
+            {'$set': {'history': series, 'ticker': ticker, 'lastUpdated': series[-1]['date']}},
             upsert=True,
         )
-        return len(merged)
+        return len(series)
     except Exception as e:
-        print(f'[sharesHistory] Error bulk-recording {ticker}: {e}')
+        print(f'[sharesHistory] Error replacing {ticker}: {e}')
         return 0
 
 
@@ -562,7 +580,11 @@ def process_ticker(ticker: str, provider_fn, request_pause: float = 0) -> tuple[
             _drop_ignored_splits(ticker, existing.get('splits') or []),
             market_data.get('splits') or [], 'splitDate'
         )
-        record_shares_history(ticker, market_data.get('sharesOutstanding'))
+        # Only crypto keeps a live-snapshot history (circulating supply). A stock's
+        # history is SEC filings alone (replace_shares_history): Yahoo's live count can
+        # be one share class (GOOGL class A) and never lines up with the filed series.
+        if crypto or is_crypto_ticker(ticker):
+            record_shares_history(ticker, market_data.get('sharesOutstanding'))
         operation = UpdateOne(
             {'ticker': ticker},
             {'$set': market_data},
@@ -886,8 +908,6 @@ def statistics_job(ticker: str) -> tuple[str, dict]:
     result = collection.update_one({'ticker': ticker}, {'$set': update})
     if result.matched_count == 0:
         return 'no_data', {'reason': 'no marketData doc for this ticker — run a full update first'}
-    if shares:
-        record_shares_history(ticker, shares)
     return 'success', {'fields': len(stats)}
 
 
@@ -916,7 +936,8 @@ def financials_job(ticker: str) -> tuple[str, dict]:
 
 def shares_outstanding_job(ticker: str) -> tuple[str, dict]:
     """
-    marketData.sharesOutstanding (+ its history) from Yahoo, or CoinGecko for crypto.
+    marketData.sharesOutstanding from Yahoo, or CoinGecko for crypto (whose
+    circulating supply also lands in its history — a stock's history is SEC only).
     A ticker with no marketData doc yet gets the full doc instead, share count included.
     """
     try:
@@ -925,7 +946,8 @@ def shares_outstanding_job(ticker: str) -> tuple[str, dict]:
             if not result['success']:
                 return 'error', {'error': result['error']}
             return 'success', {'created': True}
-        if is_crypto_ticker(ticker):
+        crypto = is_crypto_ticker(ticker)
+        if crypto:
             shares = crypto_provider.fetch_market_data(ticker).get('sharesOutstanding')
         else:
             shares = fetch_shares_outstanding(ticker)
@@ -935,7 +957,8 @@ def shares_outstanding_job(ticker: str) -> tuple[str, dict]:
     if not shares:
         return 'no_data', {'reason': 'provider reported no share count'}
     collection.update_one({'ticker': ticker}, {'$set': {'sharesOutstanding': shares}})
-    record_shares_history(ticker, shares)
+    if crypto:
+        record_shares_history(ticker, shares)
     return 'success', {'sharesOutstanding': shares}
 
 
@@ -948,12 +971,12 @@ def shares_history_job(ticker: str) -> tuple[str, dict]:
     except Exception as e:
         return 'error', {'error': str(e)}
 
+    # before the no_data answer: no filings also clears what an older run stored
+    written = replace_shares_history(ticker, entries)
     if not entries:
         cik = sec_edgar_provider.get_cik(ticker)
         reason = 'no CIK found for ticker (not SEC-registered?)' if not cik else 'no shares-outstanding filings found'
         return 'no_data', {'reason': reason}
-
-    written = record_shares_history_bulk(ticker, entries)
     return 'success', {'entriesFound': len(entries), 'entriesStored': written}
 
 
@@ -989,7 +1012,8 @@ def update_shares_outstanding_history():
     Backfill historical sharesOutstanding for one ticker from SEC EDGAR XBRL
     filings (US-registered companies only — no data for foreign private
     issuers, ADRs without SEC registration, or crypto). Body: {"ticker": "MSFT"}.
-    Merges into sharesOutstandingHistory; does NOT touch the live
+    Replaces sharesOutstandingHistory with the SEC series (no filings → doc
+    removed; crypto untouched — see replace_shares_history); does NOT touch the live
     marketData.sharesOutstanding field (SEC filings lag the current
     yfinance-sourced value, so overwriting it would make it staler, not fresher).
     """
@@ -1056,107 +1080,69 @@ def update_financials():
     return _job_response(ticker, *financials_job(ticker))
 
 
-def sec_update_one(ticker: str) -> dict:
+def sec_job(ticker: str) -> tuple[str, dict]:
     """
-    Fundamentals + shares-outstanding history for one ticker from SEC EDGAR.
-    Returns {'fundamentals': bool, 'shares': int} — False/0 simply means the
-    filer never tagged that data (or has no CIK), which is not an error.
-    Lets SecThrottled propagate: the caller must stop the whole run.
-    """
-    concepts = sec_edgar_provider.fetch_fundamentals(ticker)
-    if concepts:
-        fundamentals_collection.update_one(
-            {'_id': ticker},
-            {'$set': {'ticker': ticker, 'concepts': concepts, 'updatedAt': datetime.now()}},
-            upsert=True,
-        )
-    entries = sec_edgar_provider.fetch_shares_history(ticker)
-    stored = record_shares_history_bulk(ticker, entries) if entries else 0
-    return {'fundamentals': bool(concepts), 'shares': stored}
-
-
-def run_sec_bulk_task(tickers: list[str], pause_seconds: float):
-    """
-    Sequential SEC EDGAR backfill over many tickers. Deliberately serial: one
-    ticker costs ~15 SEC requests (14 fundamentals concepts + shares history),
-    each spaced by sec_edgar_provider.SECONDS_PER_REQUEST (default 5 s, so ~75 s
-    per ticker). pause_seconds adds slack between tickers on top of that. A full
-    portfolio run takes tens of minutes by design — SEC access is the scarce
-    resource here, not wall-clock time.
-
-    A SecThrottled (403/429) aborts the whole run instead of retrying — pushing
-    through SEC's throttle is what escalates it to an IP block. Everything
-    already written stays; re-run later to continue.
+    companyFundamentals + sharesOutstandingHistory for one ticker from SEC EDGAR —
+    what the SEC backfill runs per ticker. 1 SEC request: both read the same
+    companyfacts download (cached _FACTS_CACHE_TTL), where running fundamentals and
+    shares history as two separate passes paid for it twice. 'no_data' when the
+    filer has no CIK or tagged neither, which is not an error.
     """
     try:
-        with sec_bulk_lock:
-            sec_bulk_status.update({
-                "total": len(tickers), "processed": 0, "fundamentalsUpdated": 0,
-                "sharesUpdated": 0, "noData": [], "failed": [], "currentTicker": None,
-                "abortedReason": None, "startedAt": datetime.now().isoformat(), "finishedAt": None,
-            })
+        concepts = sec_edgar_provider.fetch_fundamentals(ticker)
+        if concepts:
+            fundamentals_collection.update_one(
+                {'_id': ticker},
+                {'$set': {'ticker': ticker, 'concepts': concepts, 'updatedAt': datetime.now()}},
+                upsert=True,
+            )
+        entries = sec_edgar_provider.fetch_shares_history(ticker)
+    except sec_edgar_provider.SecThrottled as e:
+        return 'rate_limited', {'error': str(e)}
+    except Exception as e:
+        return 'error', {'error': str(e)}
 
-        print(f"[{datetime.now()}] [sec-bulk] Starting SEC backfill of {len(tickers)} tickers "
-              f"({sec_edgar_provider.SECONDS_PER_REQUEST}s between SEC requests, "
-              f"{pause_seconds}s between tickers)...")
+    # before the no_data answer: no filings also clears what an older run stored
+    stored = replace_shares_history(ticker, entries)
+    if not concepts and not stored:
+        cik = sec_edgar_provider.get_cik(ticker)
+        reason = 'no CIK found for ticker (not SEC-registered?)' if not cik else 'no fundamentals or share-count filings found'
+        return 'no_data', {'reason': reason}
+    return 'success', {'concepts': len(concepts or {}), 'sharesPoints': stored}
 
-        for i, ticker in enumerate(tickers, 1):
-            if i > 1 and pause_seconds > 0 and not _sleep_unless_cancelled(pause_seconds, sec_bulk_lock, sec_bulk_status):
-                break
-            if _cancelled(sec_bulk_lock, sec_bulk_status):
-                break
-            with sec_bulk_lock:
-                sec_bulk_status["currentTicker"] = ticker
 
-            try:
-                result = sec_update_one(ticker)
-            except sec_edgar_provider.SecThrottled as e:
-                print(f"[sec-bulk] ABORTED at {ticker}: {e}")
-                with sec_bulk_lock:
-                    sec_bulk_status["abortedReason"] = str(e)
-                return
-            except Exception as e:
-                print(f"[sec-bulk] [{i}/{len(tickers)}] {ticker} failed: {e}")
-                with sec_bulk_lock:
-                    sec_bulk_status["failed"].append(ticker)
-                    sec_bulk_status["processed"] = i
-                continue
+def sec_event(level: str, message: str, ticker: str | None = None) -> None:
+    _push_event(sec_bulk_lock, sec_bulk_status, 'sec-bulk', level, message, ticker)
 
-            with sec_bulk_lock:
-                if result['fundamentals']:
-                    sec_bulk_status["fundamentalsUpdated"] += 1
-                if result['shares']:
-                    sec_bulk_status["sharesUpdated"] += 1
-                if not result['fundamentals'] and not result['shares']:
-                    sec_bulk_status["noData"].append(ticker)
-                sec_bulk_status["processed"] = i
 
-            print(f"[sec-bulk] [{i}/{len(tickers)}] {ticker}: "
-                  f"fundamentals={'yes' if result['fundamentals'] else 'no'} "
-                  f"sharesPoints={result['shares']}")
+def run_sec_bulk_task(tickers: list[str], pause_seconds: float, scope: str = 'all'):
+    """
+    Sequential SEC EDGAR backfill over many tickers. Deliberately serial: one
+    ticker costs 1 SEC request (sec_job), spaced by
+    sec_edgar_provider.SECONDS_PER_REQUEST (default 5 s per ticker). pause_seconds
+    adds slack between tickers on top of that — SEC access is the scarce resource
+    here, not wall-clock time.
 
-        print(f"[{datetime.now()}] [sec-bulk] Task finished.")
-    finally:
-        with sec_bulk_lock:
-            if sec_bulk_status["cancelRequested"]:
-                # never clobber a throttle abort — that reason matters more
-                if not sec_bulk_status["abortedReason"]:
-                    sec_bulk_status["abortedReason"] = "cancelled by user"
-                print(f"[{datetime.now()}] [sec-bulk] Cancelled after "
-                      f"{sec_bulk_status['processed']}/{sec_bulk_status['total']} tickers.")
-            sec_bulk_status["cancelRequested"] = False
-            sec_bulk_status["running"] = False
-            sec_bulk_status["currentTicker"] = None
-            sec_bulk_status["finishedAt"] = datetime.now().isoformat()
+    Same worker as a bulk Yahoo job (_run_jobs), in its own slot: a SecThrottled
+    (403/429) aborts the whole run instead of retrying — pushing through SEC's
+    throttle is what escalates it to an IP block — and so do 5 failures in a row.
+    Everything already written stays; re-run later to continue.
+    """
+    _run_jobs(sec_bulk_lock, sec_bulk_status, sec_event, sec_job,
+              'SEC fundamentals + shares history', tickers, pause_seconds, scope)
+
+
+SEC_SCOPES = ('holdings', 'all')
 
 
 @app.route('/update/sec/all', methods=['POST'])
 def update_sec_all():
     """
-    Background SEC EDGAR backfill (fundamentals + shares-outstanding history)
-    for every ticker in marketData, or an explicit {"tickers": [...]} subset.
-    Body: {"pauseSeconds": 1, "tickers": [...]}.
-    Returns immediately; poll GET /update/sec/all/status.
+    Background SEC EDGAR backfill (fundamentals + shares-outstanding history).
+    Body: {"scope": "holdings"|"all", "tickers": [...], "pauseSeconds": 1}.
+    scope as for a throttled run (default all = every marketData ticker); an
+    explicit tickers list overrides it. Returns immediately; poll
+    GET /update/sec/all/status.
     """
     data = request.get_json(silent=True) or {}
     try:
@@ -1171,41 +1157,43 @@ def update_sec_all():
         return jsonify({"status": "error", "error": "tickers must be a list"}), 400
 
     if requested:
-        tickers = [str(t).strip().upper() for t in requested if str(t).strip()]
+        scope = 'list'
+        tickers = sorted({str(t).strip().upper() for t in requested if str(t).strip()})
+        # Custom assets hold user-set data and their names can collide with real
+        # exchange tickers — they must never hit a provider.
+        custom_tickers = get_custom_tickers()
+        skipped_custom = [t for t in tickers if t in custom_tickers]
+        tickers = [t for t in tickers if t not in custom_tickers]
     else:
-        tickers = sorted(set(
-            doc['ticker'] for doc in collection.find({}, {'ticker': 1}) if doc.get('ticker')
-        ))
-
-    # Custom assets hold user-set data and their names can collide with real
-    # exchange tickers — they must never hit a provider.
-    custom_tickers = get_custom_tickers()
-    skipped_custom = [t for t in tickers if t in custom_tickers]
-    tickers = [t for t in tickers if t not in custom_tickers]
+        scope = str(data.get('scope') or 'all').lower()
+        if scope not in SEC_SCOPES:
+            return jsonify({"status": "error",
+                            "error": f"scope must be one of {', '.join(SEC_SCOPES)}"}), 400
+        tickers, skipped_custom = resolve_throttled_tickers(scope)
 
     if not tickers:
         return jsonify({"status": "error", "error": "no tickers to process",
-                        "skippedCustom": skipped_custom}), 400
-    if _bulk_running('sec'):
-        return jsonify({"status": "busy", "error": "a bulk SEC job is in progress"}), 409
+                        "scope": scope, "skippedCustom": skipped_custom}), 400
 
     with sec_bulk_lock:
         if sec_bulk_status["running"]:
             return jsonify({
                 "status": "already_running",
+                "scope": sec_bulk_status["scope"],
                 "processed": sec_bulk_status["processed"],
                 "total": sec_bulk_status["total"],
                 "currentTicker": sec_bulk_status["currentTicker"],
             }), 409
         sec_bulk_status["running"] = True
 
-    threading.Thread(target=run_sec_bulk_task, args=[tickers, pause_seconds], daemon=True).start()
+    threading.Thread(target=run_sec_bulk_task, args=[tickers, pause_seconds, scope], daemon=True).start()
 
-    # ~15 SEC requests per ticker at the configured spacing, plus the inter-ticker pause
+    # 1 SEC request per ticker at the configured spacing, plus the inter-ticker pause
     spacing = sec_edgar_provider.SECONDS_PER_REQUEST
-    estimate_seconds = int(len(tickers) * (15 * spacing + pause_seconds))
+    estimate_seconds = int(len(tickers) * spacing + max(len(tickers) - 1, 0) * pause_seconds)
     return jsonify({
         "status": "started",
+        "scope": scope,
         "tickers": len(tickers),
         "skippedCustom": skipped_custom,
         "secondsPerRequest": spacing,
@@ -1217,27 +1205,32 @@ def update_sec_all():
 
 @app.route('/update/sec/all/status', methods=['GET'])
 def update_sec_all_status():
-    with sec_bulk_lock:
-        return jsonify(dict(sec_bulk_status)), 200
+    """Progress of the current/last SEC backfill; ?sinceSeq=N as for the throttled run."""
+    snapshot = _events_since(sec_bulk_lock, sec_bulk_status)
+    snapshot["remainingTickers"] = max(snapshot["total"] - snapshot["processed"], 0)
+    return jsonify(snapshot), 200
 
 
 @app.route('/update/sec/all/cancel', methods=['POST'])
 def update_sec_all_cancel():
     """
     Ask the running SEC backfill to stop. Cooperative: the ticker in flight
-    finishes its ~15 SEC requests first (up to ~75 s at the default pacing), then
-    the run ends. Everything already written stays; re-run later to continue.
+    finishes its SEC request first (~5 s at the default pacing), then the run
+    ends. Everything already written stays; re-run later to continue.
     """
     with sec_bulk_lock:
         if not sec_bulk_status["running"]:
             return jsonify({"status": "not_running"}), 409
         sec_bulk_status["cancelRequested"] = True
-        return jsonify({
-            "status": "cancelling",
-            "processed": sec_bulk_status["processed"],
-            "total": sec_bulk_status["total"],
-            "currentTicker": sec_bulk_status["currentTicker"],
-        }), 202
+        processed, total = sec_bulk_status["processed"], sec_bulk_status["total"]
+        current = sec_bulk_status["currentTicker"]
+    sec_event('warn', f"Stop requested at {processed}/{total} — ending after the current ticker")
+    return jsonify({
+        "status": "cancelling",
+        "processed": processed,
+        "total": total,
+        "currentTicker": current,
+    }), 202
 
 
 def fetch_shares_outstanding(ticker: str):
@@ -1249,8 +1242,9 @@ def fetch_shares_outstanding(ticker: str):
 def update_shares_outstanding():
     """
     Backfill sharesOutstanding: single ticker via {"ticker": "..."} body,
-    or every existing marketData doc when body is empty (10 in parallel — the
-    admin panel uses the sequential POST /update/bulk instead).
+    or every existing marketData doc when body is empty (10 in parallel). A
+    throttled Holdings/All run refreshes the same field sequentially, from the
+    .info call it makes anyway.
     Unknown tickers get a full new marketData doc (which includes sharesOutstanding).
     """
     data = request.get_json(silent=True) or {}
@@ -1436,6 +1430,12 @@ def run_throttled_task(ticker_symbols: list[str], pause_seconds: float, scope: s
     rate limits. Each ticker is written to marketData and removed from the queue
     immediately, so an interrupted run loses nothing.
 
+    A Yahoo ticker gets everything yahoo_fetch_market_data writes: price,
+    dividends, splits, daily + monthly history, key statistics, sharesOutstanding,
+    and financial statements once they are YF_FINANCIALS_MAX_AGE_DAYS old. So a
+    Holdings/All run already covers the bulk statistics job (except for coins)
+    and most of the financials one; SEC data is the SEC backfill's.
+
     Crypto goes to CoinGecko, same as /update/auto: Yahoo's .info carries no
     currentPrice for a crypto pair, so a Yahoo pass refreshed a coin's name and
     previous close but left its price where it was.
@@ -1567,7 +1567,7 @@ def update_throttled():
     if not tickers:
         return jsonify({"status": "error", "error": "no tickers to process",
                         "scope": scope, "skippedCustom": len(skipped_custom)}), 400
-    if _bulk_running('yahoo'):
+    if _bulk_running():
         return jsonify({"status": "busy", "error": "a bulk Yahoo job is in progress"}), 409
 
     with throttled_lock:
@@ -1689,25 +1689,29 @@ def update_throttled_cancel():
 
 # ---------- Bulk per-ticker jobs (POST /update/bulk) ----------
 #
-# One of the per-ticker jobs above, run over every holding or every marketData
-# ticker: sequential, one ticker at a time with a pause between them, one run at a
-# time. The admin panel's "Statistics & shares" card starts it.
+# One of the per-ticker Yahoo jobs above, run over every holding or every
+# marketData ticker: sequential, one ticker at a time with a pause between them,
+# one run at a time. The admin panel's "Statistics & financials" card starts it.
+#
+# Only what a throttled run does not already cover. A throttled Yahoo pass writes
+# statistics and sharesOutstanding from the same .info call, and financials once
+# they are YF_FINANCIALS_MAX_AGE_DAYS old, so a bulk sharesOutstanding job was a
+# straight duplicate and is gone. statistics stays as the cheap pass (3 requests,
+# no history download) and the only one that reaches coins — the throttled run
+# takes those to CoinGecko, which has no statistics. financials stays as the way
+# past the age gate. SEC jobs run through the SEC backfill (sec_job), which reads
+# fundamentals and shares history off one companyfacts download.
 
-# job -> (function, label, provider). The provider sets the default pause and the
-# run it must not overlap: Yahoo jobs share Yahoo with the throttled run, SEC jobs
-# share SEC's process-wide limit with the SEC backfill.
+# job -> (function, label). Both use Yahoo, so a bulk run and a throttled run
+# refuse to overlap — two runs on one provider double its request rate.
 BULK_JOBS = {
-    'statistics': (statistics_job, 'Yahoo statistics', 'yahoo'),
-    'financials': (financials_job, 'Yahoo financials', 'yahoo'),
-    'sharesOutstanding': (shares_outstanding_job, 'shares outstanding', 'yahoo'),
-    'sharesHistory': (shares_history_job, 'shares history (SEC)', 'sec'),
-    'fundamentals': (fundamentals_job, 'fundamentals (SEC)', 'sec'),
+    'statistics': (statistics_job, 'Yahoo statistics'),
+    'financials': (financials_job, 'Yahoo financials'),
 }
 BULK_SCOPES = ('holdings', 'all')
-BULK_DEFAULT_PAUSE = {'yahoo': 5.0, 'sec': 1.0}
-# SEC requests per ticker, for the estimate (each paced at SEC_SECONDS_PER_REQUEST).
-# A Yahoo job answers in about 2 s.
-BULK_SEC_REQUESTS = {'sharesHistory': 3, 'fundamentals': 15}
+BULK_DEFAULT_PAUSE = 5.0
+# A Yahoo job answers in about 2 s, for the estimate.
+BULK_SECONDS_PER_TICKER = 2
 # yfinance does not report a Yahoo rate limit as such — calls fail or come back
 # empty. Five failures in a row is the tell, and pushing on through a throttle is
 # what turns it into a longer block. A SEC 403/429 stops the run at once.
@@ -1741,11 +1745,10 @@ def bulk_event(level: str, message: str, ticker: str | None = None) -> None:
     _push_event(bulk_lock, bulk_status, 'bulk', level, message, ticker)
 
 
-def _bulk_running(provider: str) -> bool:
-    """True while a bulk run of a job that uses this provider is going."""
+def _bulk_running() -> bool:
+    """True while a bulk Yahoo job is going."""
     with bulk_lock:
-        job = bulk_status["job"]
-        return bool(bulk_status["running"] and job and BULK_JOBS[job][2] == provider)
+        return bool(bulk_status["running"])
 
 
 def _job_summary(details: dict) -> str:
@@ -1756,105 +1759,122 @@ def _job_summary(details: dict) -> str:
     return ', '.join(parts)
 
 
-def run_bulk_task(job: str, tickers: list[str], pause_seconds: float, scope: str):
-    fn, label, _provider = BULK_JOBS[job]
+def _run_jobs(lock, status: dict, event, fn, label: str, tickers: list[str],
+              pause_seconds: float, scope: str) -> None:
+    """
+    Run one per-ticker job — fn(ticker) -> (status, details) — over many tickers,
+    sequentially, recording progress in `status` under `lock` and streaming each
+    result through `event`. The worker behind both a bulk Yahoo job and the SEC
+    backfill; each has its own slot, so the two can run side by side.
+
+    Stops on its own on a 'rate_limited' answer and after
+    BULK_MAX_CONSECUTIVE_FAILURES failures in a row. Cancel is checked between
+    tickers only: the ticker in flight is always finished and written first.
+    """
     total = len(tickers)
     try:
-        with bulk_lock:
-            bulk_status.update({
-                "job": job, "jobLabel": label, "scope": scope,
+        with lock:
+            status.update({
+                "scope": scope,
                 "total": total, "processed": 0, "updated": 0, "noData": [], "failed": [],
                 "pauseSeconds": pause_seconds, "currentTicker": None, "currentStage": None,
                 "abortedReason": None,
                 "startedAt": datetime.now().isoformat(), "finishedAt": None,
                 "events": [],   # eventSeq keeps counting: a poller's cursor never goes back
             })
-        bulk_event('info', f"Starting {label} for {total} tickers [scope={scope}], "
-                           f"{pause_seconds}s between tickers")
+        event('info', f"Starting {label} for {total} tickers [scope={scope}], "
+                      f"{pause_seconds}s between tickers")
 
         consecutive_failures = 0
         for i, ticker in enumerate(tickers, 1):
             if i > 1 and pause_seconds > 0:
-                with bulk_lock:
-                    bulk_status["currentTicker"] = ticker
-                    bulk_status["currentStage"] = "waiting"
-                if not _sleep_unless_cancelled(pause_seconds, bulk_lock, bulk_status):
+                with lock:
+                    status["currentTicker"] = ticker
+                    status["currentStage"] = "waiting"
+                if not _sleep_unless_cancelled(pause_seconds, lock, status):
                     break
-            if _cancelled(bulk_lock, bulk_status):
+            if _cancelled(lock, status):
                 break
 
             position = f"{i}/{total}"
-            with bulk_lock:
-                bulk_status["currentTicker"] = ticker
-                bulk_status["currentStage"] = "fetching"
+            with lock:
+                status["currentTicker"] = ticker
+                status["currentStage"] = "fetching"
             try:
-                status, details = fn(ticker)
+                outcome, details = fn(ticker)
             except Exception as e:   # the jobs catch their own; this is the backstop
-                status, details = 'error', {'error': str(e)}
+                outcome, details = 'error', {'error': str(e)}
 
-            with bulk_lock:
-                bulk_status["processed"] = i
-                if status == 'success':
-                    bulk_status["updated"] += 1
-                elif status == 'no_data':
-                    bulk_status["noData"].append(ticker)
+            with lock:
+                status["processed"] = i
+                if outcome == 'success':
+                    status["updated"] += 1
+                elif outcome == 'no_data':
+                    status["noData"].append(ticker)
                 else:
-                    bulk_status["failed"].append({
+                    status["failed"].append({
                         "ticker": ticker,
-                        "stage": status,
+                        "stage": outcome,
                         "error": details.get('error') or details.get('reason'),
                         "at": datetime.now().isoformat(),
                     })
 
-            if status == 'success':
+            if outcome == 'success':
                 consecutive_failures = 0
-                bulk_event('ok', f"[{position}] {ticker}: updated ({_job_summary(details)})", ticker)
-            elif status == 'no_data':
+                event('ok', f"[{position}] {ticker}: updated ({_job_summary(details)})", ticker)
+            elif outcome == 'no_data':
                 consecutive_failures = 0
-                bulk_event('warn', f"[{position}] {ticker}: no data — {details.get('reason')}", ticker)
+                event('warn', f"[{position}] {ticker}: no data — {details.get('reason')}", ticker)
             else:
                 consecutive_failures += 1
                 error = details.get('error') or details.get('reason')
-                bulk_event('err', f"[{position}] {ticker}: {status} — {error}", ticker)
-                if status == 'rate_limited':
-                    with bulk_lock:
-                        bulk_status["abortedReason"] = f"rate-limited at {ticker}: {error}"
+                event('err', f"[{position}] {ticker}: {outcome} — {error}", ticker)
+                if outcome == 'rate_limited':
+                    with lock:
+                        status["abortedReason"] = f"rate-limited at {ticker}: {error}"
                     break
                 if consecutive_failures >= BULK_MAX_CONSECUTIVE_FAILURES:
-                    with bulk_lock:
-                        bulk_status["abortedReason"] = (f"{consecutive_failures} failures in a row — "
-                                                        f"provider rate-limiting? Re-run later")
+                    with lock:
+                        status["abortedReason"] = (f"{consecutive_failures} failures in a row — "
+                                                   f"provider rate-limiting? Re-run later")
                     break
     except Exception as e:
         traceback.print_exc()
-        with bulk_lock:
-            bulk_status["abortedReason"] = f"crashed: {e}"
+        with lock:
+            status["abortedReason"] = f"crashed: {e}"
     finally:
-        with bulk_lock:
-            if bulk_status["cancelRequested"] and not bulk_status["abortedReason"]:
-                bulk_status["abortedReason"] = "cancelled by user"
-            processed, aborted = bulk_status["processed"], bulk_status["abortedReason"]
-            updated, no_data, failed = bulk_status["updated"], len(bulk_status["noData"]), len(bulk_status["failed"])
-            bulk_status["cancelRequested"] = False
-            bulk_status["currentTicker"] = None
-            bulk_status["currentStage"] = None
-            bulk_status["running"] = False
-            bulk_status["finishedAt"] = datetime.now().isoformat()
-        bulk_event('warn' if aborted or failed else 'ok',
-                   f"{label}: finished {processed}/{total} — {updated} updated, {no_data} no data, "
-                   f"{failed} failed" + (f" — aborted: {aborted}" if aborted else ""))
+        with lock:
+            # never clobber a rate-limit or crash reason — those need reading
+            if status["cancelRequested"] and not status["abortedReason"]:
+                status["abortedReason"] = "cancelled by user"
+            processed, aborted = status["processed"], status["abortedReason"]
+            updated, no_data, failed = status["updated"], len(status["noData"]), len(status["failed"])
+            status["cancelRequested"] = False
+            status["currentTicker"] = None
+            status["currentStage"] = None
+            status["running"] = False
+            status["finishedAt"] = datetime.now().isoformat()
+        event('warn' if aborted or failed else 'ok',
+              f"{label}: finished {processed}/{total} — {updated} updated, {no_data} no data, "
+              f"{failed} failed" + (f" — aborted: {aborted}" if aborted else ""))
+
+
+def run_bulk_task(job: str, tickers: list[str], pause_seconds: float, scope: str):
+    fn, label = BULK_JOBS[job]
+    with bulk_lock:
+        bulk_status.update({"job": job, "jobLabel": label})
+    _run_jobs(bulk_lock, bulk_status, bulk_event, fn, label, tickers, pause_seconds, scope)
 
 
 @app.route('/update/bulk', methods=['POST'])
 def update_bulk():
     """
-    Run one per-ticker job over many tickers in the background.
-    Body: {"job": "statistics"|"financials"|"sharesOutstanding"|"sharesHistory"|"fundamentals",
-           "scope": "holdings"|"all", "pauseSeconds": N}.
+    Run one per-ticker Yahoo job over many tickers in the background.
+    Body: {"job": "statistics"|"financials", "scope": "holdings"|"all", "pauseSeconds": N}.
     holdings = every ticker held in any portfolio, all = every ticker with a
     marketData doc; custom assets are always skipped. Default pause 5 s between
-    tickers for Yahoo jobs, 1 s for SEC jobs (which SEC pacing slows further).
-    Returns immediately; poll GET /update/bulk/status.
+    tickers. SEC data goes through POST /update/sec/all. Returns immediately;
+    poll GET /update/bulk/status.
     """
     data = request.get_json(silent=True) or {}
     job = data.get('job')
@@ -1863,9 +1883,9 @@ def update_bulk():
     scope = str(data.get('scope') or 'holdings').lower()
     if scope not in BULK_SCOPES:
         return jsonify({"status": "error", "error": f"scope must be one of {', '.join(BULK_SCOPES)}"}), 400
-    _fn, label, provider = BULK_JOBS[job]
+    _fn, label = BULK_JOBS[job]
     try:
-        pause_seconds = float(data.get('pauseSeconds', BULK_DEFAULT_PAUSE[provider]))
+        pause_seconds = float(data.get('pauseSeconds', BULK_DEFAULT_PAUSE))
     except (TypeError, ValueError):
         return jsonify({"status": "error", "error": "pauseSeconds must be a number"}), 400
     if pause_seconds < 0:
@@ -1876,16 +1896,10 @@ def update_bulk():
         return jsonify({"status": "error", "error": "no tickers to process", "scope": scope}), 400
 
     # Two runs on one provider would double its request rate behind each other's back.
-    if provider == 'yahoo':
-        with throttled_lock:
-            busy = throttled_status["running"]
-        if busy:
-            return jsonify({"status": "busy", "error": "a throttled Yahoo run is in progress"}), 409
-    else:
-        with sec_bulk_lock:
-            busy = sec_bulk_status["running"]
-        if busy:
-            return jsonify({"status": "busy", "error": "a SEC bulk backfill is in progress"}), 409
+    with throttled_lock:
+        busy = throttled_status["running"]
+    if busy:
+        return jsonify({"status": "busy", "error": "a throttled Yahoo run is in progress"}), 409
 
     with bulk_lock:
         if bulk_status["running"]:
@@ -1900,9 +1914,8 @@ def update_bulk():
 
     threading.Thread(target=run_bulk_task, args=[job, tickers, pause_seconds, scope], daemon=True).start()
 
-    per_ticker = (BULK_SEC_REQUESTS[job] * sec_edgar_provider.SECONDS_PER_REQUEST
-                  if provider == 'sec' else 2)
-    estimate_seconds = int(len(tickers) * per_ticker + max(len(tickers) - 1, 0) * pause_seconds)
+    estimate_seconds = int(len(tickers) * BULK_SECONDS_PER_TICKER
+                           + max(len(tickers) - 1, 0) * pause_seconds)
     return jsonify({
         "status": "started",
         "job": job,
@@ -2070,22 +2083,28 @@ OPENAPI_SPEC = {
         },
         '/update/bulk': {
             'post': {
-                'summary': 'Run one per-ticker job (statistics, financials, sharesOutstanding, sharesHistory, fundamentals) over every holding or every marketData ticker — background, sequential, one run at a time',
+                'summary': 'Run one per-ticker Yahoo job (statistics, financials) over every holding or every marketData ticker — background, sequential, one run at a time',
+                'description': (
+                    'Only what a throttled run does not cover: a throttled Holdings/All run already '
+                    'writes statistics and sharesOutstanding, and financials once they are 7 days old. '
+                    'statistics is the cheap pass (one .info, no history download) and the only one that '
+                    'reaches coins; financials ignores the age gate. SEC data: POST /update/sec/all.'
+                ),
                 'requestBody': {
                     'required': True,
                     'content': {'application/json': {'schema': {
                         'type': 'object',
                         'required': ['job'],
                         'properties': {
-                            'job': {'type': 'string', 'enum': ['statistics', 'financials', 'sharesOutstanding', 'sharesHistory', 'fundamentals']},
-                            'scope': {'type': 'string', 'enum': ['holdings', 'all'], 'default': 'holdings'},
-                            'pauseSeconds': {'type': 'number', 'description': 'between tickers; default 5 (Yahoo jobs) / 1 (SEC jobs)'},
+                            'job': {'type': 'string', 'enum': list(BULK_JOBS)},
+                            'scope': {'type': 'string', 'enum': list(BULK_SCOPES), 'default': 'holdings'},
+                            'pauseSeconds': {'type': 'number', 'description': f'between tickers; default {BULK_DEFAULT_PAUSE:g}'},
                         },
                     }}},
                 },
                 'responses': {'202': {'description': '{status: "started", job, scope, tickers, skippedCustom, pauseSeconds, estimatedSeconds, estimatedMinutes}'},
                               '400': {'description': 'bad job/scope/pauseSeconds, or no tickers'},
-                              '409': {'description': 'a bulk run is already going, or a throttled run / SEC backfill holds the same provider'}},
+                              '409': {'description': 'a bulk run is already going, or a throttled run holds Yahoo'}},
             },
         },
         '/update/bulk/status': {
@@ -2104,7 +2123,7 @@ OPENAPI_SPEC = {
         },
         '/update/sharesOutstandingHistory': {
             'post': {
-                'summary': 'Backfill historical sharesOutstanding for one US-listed ticker from SEC EDGAR XBRL filings (does not touch the live marketData value)',
+                'summary': 'Replace the share-count history of one US-listed ticker with its SEC EDGAR XBRL filings (no filings removes it; crypto untouched; does not touch the live marketData value)',
                 'requestBody': {
                     'required': True,
                     'content': {'application/json': {'schema': {
@@ -2121,50 +2140,54 @@ OPENAPI_SPEC = {
         },
         '/update/sec/all': {
             'post': {
-                'summary': 'Bulk SEC EDGAR backfill (fundamentals + shares-outstanding history) for every marketData ticker, or a given subset',
+                'summary': 'Bulk SEC EDGAR backfill (fundamentals + shares-outstanding history) over every holding, every marketData ticker, or a given list',
                 'description': (
-                    'Runs in the background, one ticker at a time. Each ticker costs ~15 SEC requests '
-                    '(14 fundamentals concepts + shares history), and every SEC request is spaced '
-                    'process-wide by SEC_SECONDS_PER_REQUEST — default 5 s, i.e. ~75 s per ticker, so a '
-                    'whole portfolio takes tens of minutes. That is well under SEC\'s 10 req/s fair-access '
+                    'Runs in the background, one ticker at a time. Each ticker costs 1 SEC request '
+                    '(one companyfacts download serves fundamentals and shares history), and every SEC '
+                    'request is spaced process-wide by SEC_SECONDS_PER_REQUEST — default 5 s per ticker. '
+                    'That is well under SEC\'s 10 req/s fair-access '
                     'ceiling on purpose. pauseSeconds adds slack between tickers on top. '
                     'A 403/429 from SEC aborts the run (abortedReason in status) rather than retrying, '
-                    'because pushing through a throttle escalates it to an IP block. '
+                    'because pushing through a throttle escalates it to an IP block; so do 5 failures in a row. '
                     'Custom-asset tickers are skipped; non-SEC-registered tickers (foreign issuers, crypto) '
-                    'land in noData, which is not an error. Poll GET /update/sec/all/status for progress.'
+                    'land in noData, which is not an error. Runs beside a throttled or bulk Yahoo run — '
+                    'different provider. Poll GET /update/sec/all/status for progress.'
                 ),
                 'requestBody': {
                     'required': False,
                     'content': {'application/json': {'schema': {
                         'type': 'object',
                         'properties': {
-                            'pauseSeconds': {'type': 'number', 'example': 1,
-                                             'description': 'Extra pause between tickers (default 1)'},
+                            'scope': {'type': 'string', 'enum': list(SEC_SCOPES), 'default': 'all',
+                                      'description': 'holdings = every ticker held, all = every marketData ticker'},
                             'tickers': {'type': 'array', 'items': {'type': 'string'},
                                         'example': ['MSFT', 'KO'],
-                                        'description': 'Subset to process; omit for every marketData ticker'},
+                                        'description': 'Explicit list; overrides scope (reported as scope "list")'},
+                            'pauseSeconds': {'type': 'number', 'example': 1,
+                                             'description': 'Extra pause between tickers (default 1)'},
                         },
                     }}},
                 },
                 'responses': {
-                    '202': {'description': '{status: "started", tickers, skippedCustom[], secondsPerRequest, pauseSeconds, estimatedSeconds, estimatedMinutes}'},
-                    '400': {'description': 'Invalid pauseSeconds/tickers, or nothing to process'},
-                    '409': {'description': 'A SEC bulk run is already in progress'},
+                    '202': {'description': '{status: "started", scope, tickers, skippedCustom[], secondsPerRequest, pauseSeconds, estimatedSeconds, estimatedMinutes}'},
+                    '400': {'description': 'Invalid pauseSeconds/scope/tickers, or nothing to process'},
+                    '409': {'description': 'A SEC backfill is already in progress'},
                 },
             },
         },
         '/update/sec/all/status': {
             'get': {
-                'summary': 'Progress of the current/last SEC bulk backfill',
-                'responses': {'200': {'description': '{running, total, processed, fundamentalsUpdated, sharesUpdated, noData[], failed[], currentTicker, cancelRequested, abortedReason, startedAt, finishedAt}'}},
+                'summary': 'Progress of the current/last SEC bulk backfill: counters, noData[], failed[{ticker, stage, error, at}], abortedReason, events[] (pass ?sinceSeq=N for only newer events)',
+                'parameters': [{'name': 'sinceSeq', 'in': 'query', 'required': False, 'schema': {'type': 'integer'}}],
+                'responses': {'200': {'description': '{running, scope, total, processed, updated, noData[], failed[], pauseSeconds, currentTicker, currentStage, remainingTickers, cancelRequested, abortedReason, startedAt, finishedAt, events[], eventSeq}'}},
             },
         },
         '/update/sec/all/cancel': {
             'post': {
                 'summary': 'Stop the running SEC bulk backfill',
                 'description': (
-                    'Cooperative stop. The ticker in flight finishes its ~15 SEC requests first '
-                    '(up to ~75 s at default pacing), then the run ends with abortedReason '
+                    'Cooperative stop. The ticker in flight finishes its SEC request first '
+                    '(~5 s at default pacing), then the run ends with abortedReason '
                     '"cancelled by user". Work already written stays; re-run later to continue.'
                 ),
                 'responses': {'202': {'description': '{status: "cancelling", processed, total, currentTicker}'},
@@ -2179,7 +2202,10 @@ OPENAPI_SPEC = {
                     'only what a transaction enqueued since the last run, emptied as it is processed; '
                     '"holdings" takes every ticker currently held in any portfolio; "all" takes every '
                     'ticker that has a marketData doc. Custom assets are always skipped. '
-                    'Roughly 4 Yahoo requests and 2 pauses per ticker.'
+                    'Roughly 4 Yahoo requests and 2 pauses per ticker. Writes price, dividends, splits, '
+                    'daily + monthly history, key statistics, sharesOutstanding, and financial statements '
+                    'once they are 7 days old (+5 requests); crypto goes to CoinGecko (price + circulating '
+                    'supply, no statistics).'
                 ),
                 'requestBody': {
                     'required': False,
@@ -2409,17 +2435,33 @@ ADMIN_HTML = """<!doctype html>
   </div>
 
   <div class="card">
+    <h2>Full refresh</h2>
+    <p class="hint">Starts a <b>throttled run</b> and a <b>SEC backfill</b> over the same tickers, side by side &mdash;
+      Yahoo/CoinGecko and SEC are separate providers, so neither waits on the other. Between them that is every
+      field this service stores for a ticker. Each run uses the pause set in its own card below and reports there.</p>
+    <div class="row">
+      <span class="seg" id="fullScopeSeg">
+        <button class="on" data-s="holdings">Holdings <b data-cnt="holdings">–</b></button>
+        <button data-s="all">All <b data-cnt="all">–</b></button>
+      </span>
+      <button class="primary" id="fullStart" onclick="startFull()">Start full refresh</button>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Throttled run</h2>
     <p class="hint">Sequential Yahoo pass, sleeping between every request. One run at a time.
+      Writes price, dividends, splits, daily + monthly history, key statistics, shares outstanding, and
+      financial statements once they are 7 days old; coins go to CoinGecko (price + circulating supply).
       <b>Queue</b> = only what a transaction enqueued since the last run (it empties as it goes).
       <b>Holdings</b> = every ticker you currently hold. <b>All</b> = every ticker with a marketData doc.
       Custom assets are always skipped. Pause holds the run after the ticker in flight and keeps its
       place; every ticker and every failure reason streams into the log below.</p>
     <div class="row">
       <span class="seg" id="scopeSeg">
-        <button class="on" data-s="queue">Queue <b id="cntQueue">–</b></button>
-        <button data-s="holdings">Holdings <b id="cntHoldings">–</b></button>
-        <button data-s="all">All <b id="cntAll">–</b></button>
+        <button class="on" data-s="queue">Queue <b data-cnt="queue">–</b></button>
+        <button data-s="holdings">Holdings <b data-cnt="holdings">–</b></button>
+        <button data-s="all">All <b data-cnt="all">–</b></button>
       </span>
       <label class="f">pause <input type="number" id="thrPause" value="15" min="0" step="1"> s</label>
       <button class="primary" id="thrStart" onclick="startThrottled()">Start run</button>
@@ -2437,27 +2479,23 @@ ADMIN_HTML = """<!doctype html>
   </div>
 
   <div class="card">
-    <h2>Statistics &amp; shares</h2>
-    <p class="hint"><b>One ticker</b> runs the job right away. <b>Holdings</b> (every ticker you hold) and
-      <b>All</b> (every marketData ticker) run it in the background, one ticker at a time with the pause
-      between them, and stream each result into the log. One bulk run at a time; custom assets are skipped.
-      SEC jobs are also paced by the SEC limit (~15 s per ticker for shares history, ~75 s for fundamentals)
-      and stop on a 429. Any run stops after 5 failures in a row.</p>
+    <h2>Statistics &amp; financials (no prices)</h2>
+    <p class="hint">A throttled run already writes both &mdash; financials once they are 7 days old. Use this for
+      a cheap statistics pass without the price download (3 Yahoo requests a ticker, not 4&ndash;9 plus the full
+      history), statistics for coins (the throttled run takes them to CoinGecko, which has none), or financials
+      regardless of age. <b>One ticker</b> runs the job right away; <b>Holdings</b> and <b>All</b> run it in the
+      background with the pause between tickers and stream each result into the log. Refused while a throttled
+      run holds Yahoo; stops after 5 failures in a row.</p>
     <div class="row">
       <span class="seg" id="statsScopeSeg">
         <button class="on" data-s="ticker">One ticker</button>
-        <button data-s="holdings">Holdings <b id="cntHoldingsB">–</b></button>
-        <button data-s="all">All <b id="cntAllB">–</b></button>
+        <button data-s="holdings">Holdings <b data-cnt="holdings">–</b></button>
+        <button data-s="all">All <b data-cnt="all">–</b></button>
       </span>
       <input type="text" id="statsTicker" placeholder="MSFT" size="12">
       <label class="f" id="bulkPauseLbl" style="display:none">pause <input type="number" id="bulkPause" value="5" min="0" step="1"> s</label>
-    </div>
-    <div class="row">
-      <button onclick="statsJob('statistics')">Yahoo statistics</button>
-      <button onclick="statsJob('financials')">Yahoo financials</button>
-      <button onclick="statsJob('sharesOutstanding')">Shares outstanding</button>
-      <button onclick="statsJob('sharesHistory')">Shares history (SEC)</button>
-      <button onclick="statsJob('fundamentals')">Fundamentals (SEC)</button>
+      <button onclick="statsJob('statistics')">Statistics</button>
+      <button onclick="statsJob('financials')">Financials</button>
       <button class="danger" id="bulkStop" onclick="stopBulk()" disabled>Stop</button>
     </div>
     <div class="bar"><i id="bulkBar"></i></div>
@@ -2465,11 +2503,19 @@ ADMIN_HTML = """<!doctype html>
   </div>
 
   <div class="card">
-    <h2>SEC bulk backfill</h2>
-    <p class="hint">Fundamentals + shares history for every marketData ticker, or the subset listed below. Slow &mdash; roughly 75 s per ticker at the default SEC pacing; aborts rather than pushing through a 429.</p>
+    <h2>SEC EDGAR &mdash; fundamentals + shares history</h2>
+    <p class="hint">One companyfacts download per ticker serves both: 1 SEC request, roughly 5 s at the default
+      pacing. <b>Holdings</b> = every ticker you hold, <b>All</b> = every marketData ticker, <b>List</b> = the tickers
+      typed (one is fine). Runs beside a throttled run. Stops on a SEC 403/429 rather than pushing through it, and
+      after 5 failures in a row; non-US issuers and coins land in <i>no data</i>.</p>
     <div class="row">
+      <span class="seg" id="secScopeSeg">
+        <button class="on" data-s="holdings">Holdings <b data-cnt="holdings">–</b></button>
+        <button data-s="all">All <b data-cnt="all">–</b></button>
+        <button data-s="list">List</button>
+      </span>
+      <input type="text" id="secTickers" placeholder="MSFT, AAPL, MA" style="display:none">
       <label class="f">pause <input type="number" id="secPause" value="1" min="0" step="0.5"> s</label>
-      <input type="text" id="secTickers" placeholder="optional subset: MSFT, AAPL, MA">
       <button class="primary" id="secStart" onclick="startSec()">Start backfill</button>
       <button class="danger" id="secStop" onclick="stopSec()" disabled>Stop</button>
     </div>
@@ -2484,21 +2530,34 @@ ADMIN_HTML = """<!doctype html>
 </div>
 
 <script>
+// A segmented control: lights the clicked button and hands its data-* value on.
+function bindSeg(id, key, onPick) {
+  document.getElementById(id).addEventListener('click', function (e) {
+    var b = e.target.closest('button');
+    if (!b) return;
+    [].forEach.call(this.querySelectorAll('button'), function (x) { x.classList.toggle('on', x === b); });
+    onPick(b.dataset[key]);
+  });
+}
+
 var provider = 'auto';
-document.getElementById('providerSeg').addEventListener('click', function (e) {
-  var b = e.target.closest('button');
-  if (!b) return;
-  provider = b.dataset.p;
-  [].forEach.call(this.querySelectorAll('button'), function (x) { x.classList.toggle('on', x === b); });
-});
+bindSeg('providerSeg', 'p', function (v) { provider = v; });
 
 var scope = 'queue';
-document.getElementById('scopeSeg').addEventListener('click', function (e) {
-  var b = e.target.closest('button');
-  if (!b) return;
-  scope = b.dataset.s;
-  [].forEach.call(this.querySelectorAll('button'), function (x) { x.classList.toggle('on', x === b); });
+bindSeg('scopeSeg', 's', function (v) { scope = v; });
+
+var fullScope = 'holdings';
+bindSeg('fullScopeSeg', 's', function (v) { fullScope = v; });
+
+var secScope = 'holdings';
+bindSeg('secScopeSeg', 's', function (v) {
+  secScope = v;
+  document.getElementById('secTickers').style.display = v === 'list' ? '' : 'none';
 });
+
+// What each scope would process (custom assets excluded), from /admin/summary.
+var scopeCounts = {};
+function countOf(s) { return Number(scopeCounts[s]) || 0; }
 
 // Log lines and progress text carry server strings (exception messages, tickers the
 // user typed) — escaped, so one containing markup renders as text instead of HTML.
@@ -2544,21 +2603,15 @@ function post(path, body, label) {
 
 function guard(fn) { try { fn(); } catch (e) { log(e.message, 'err'); } }
 
-// "Statistics & shares": one ticker straight to its endpoint, or a bulk run over a scope.
+// "Statistics & financials": one ticker straight to its endpoint, or a bulk run over a scope.
 var STATS_JOBS = {
   statistics: {path: '/update/statistics', label: 'Yahoo statistics'},
-  financials: {path: '/update/financials', label: 'Yahoo financials'},
-  sharesOutstanding: {path: '/update/sharesOutstanding', label: 'shares outstanding'},
-  sharesHistory: {path: '/update/sharesOutstandingHistory', label: 'shares history (SEC)', sec: true},
-  fundamentals: {path: '/update/fundamentals', label: 'fundamentals (SEC)', sec: true}
+  financials: {path: '/update/financials', label: 'Yahoo financials'}
 };
 var statsScope = 'ticker';
-document.getElementById('statsScopeSeg').addEventListener('click', function (e) {
-  var b = e.target.closest('button');
-  if (!b) return;
-  statsScope = b.dataset.s;
-  [].forEach.call(this.querySelectorAll('button'), function (x) { x.classList.toggle('on', x === b); });
-  var one = statsScope === 'ticker';
+bindSeg('statsScopeSeg', 's', function (v) {
+  statsScope = v;
+  var one = v === 'ticker';
   document.getElementById('statsTicker').style.display = one ? '' : 'none';
   document.getElementById('bulkPauseLbl').style.display = one ? 'none' : '';
 });
@@ -2571,9 +2624,8 @@ function statsJob(job) {
     return;
   }
   var pause = Number(document.getElementById('bulkPause').value);
-  var n = Number(document.getElementById(statsScope === 'holdings' ? 'cntHoldingsB' : 'cntAllB').textContent) || 0;
-  var perTicker = j.sec ? (job === 'fundamentals' ? 75 : 15) : 2;
-  var mins = Math.round(n * (perTicker + pause) / 60);
+  var n = countOf(statsScope);
+  var mins = Math.round(n * (2 + pause) / 60);
   if (!confirm('Run ' + j.label + ' for ' + n + ' ticker(s) [' + statsScope + '], one at a time, ' +
                pause + ' s between tickers?\\n\\nRoughly ' + mins + ' min.')) return;
   post('/update/bulk', {job: job, scope: statsScope, pauseSeconds: pause}, j.label + ' [' + statsScope + ']').then(function (r) {
@@ -2612,16 +2664,63 @@ function updateFx() {
   post('/update/exchangeRates', {}, 'FX rates').then(loadSummary);
 }
 
-function startThrottled() {
+// Two pauses per ticker (inside the fetch, then between tickers), as the server estimates.
+function throttledMinutes(n) {
+  return Math.round(Math.max(2 * n - 1, 0) * Number(document.getElementById('thrPause').value) / 60);
+}
+
+function launchThrottled(s) {
   var pause = Number(document.getElementById('thrPause').value);
-  var counts = {queue: 'cntQueue', holdings: 'cntHoldings', all: 'cntAll'};
-  var n = Number(document.getElementById(counts[scope]).textContent) || 0;
-  var mins = Math.round((2 * n - 1) * pause / 60);
-  if (!confirm('Start a throttled Yahoo run over ' + n + ' ticker(s) [' + scope + '] at ' + pause + 's per request?\\n\\nRoughly ' + mins + ' min.')) return;
-  post('/update/throttled', {pauseSeconds: pause, scope: scope}, 'throttled run [' + scope + ']').then(function (r) {
+  return post('/update/throttled', {pauseSeconds: pause, scope: s}, 'throttled run [' + s + ']').then(function (r) {
     if (r.json && r.json.estimatedMinutes != null) log('throttled estimate: ~' + r.json.estimatedMinutes + ' min for ' + r.json.tickers + ' tickers', 'warn');
     pollThrottled();
   });
+}
+
+function startThrottled() {
+  var n = countOf(scope);
+  var pause = Number(document.getElementById('thrPause').value);
+  if (!confirm('Start a throttled Yahoo run over ' + n + ' ticker(s) [' + scope + '] at ' + pause + 's per request?\\n\\nRoughly ' + throttledMinutes(n) + ' min.')) return;
+  launchThrottled(scope);
+}
+
+// SEC paces itself at ~5 s a ticker (one companyfacts request), plus the pause between tickers.
+function secMinutes(n) {
+  return Math.round(n * (5 + Number(document.getElementById('secPause').value)) / 60);
+}
+
+function launchSec(body) {
+  body.pauseSeconds = Number(document.getElementById('secPause').value);
+  var label = 'SEC backfill [' + (body.tickers ? 'list' : body.scope) + ']';
+  return post('/update/sec/all', body, label).then(function (r) {
+    if (r.json && r.json.estimatedMinutes != null) log('SEC estimate: ~' + r.json.estimatedMinutes + ' min for ' + r.json.tickers + ' tickers', 'warn');
+    pollSec();
+  });
+}
+
+function startSec() {
+  var body = {};
+  if (secScope === 'list') {
+    var raw = (document.getElementById('secTickers').value || '').trim();
+    body.tickers = raw.split(',').map(function (s) { return s.trim().toUpperCase(); }).filter(Boolean);
+    if (!body.tickers.length) { log('SEC backfill: type at least one ticker for List', 'err'); return; }
+  } else {
+    body.scope = secScope;
+  }
+  var n = body.tickers ? body.tickers.length : countOf(secScope);
+  if (!confirm('Start SEC backfill (fundamentals + shares history) for ' + n + ' ticker(s) [' + (body.tickers ? 'list' : secScope) + ']?\\n\\nRoughly ' + secMinutes(n) + ' min.')) return;
+  launchSec(body);
+}
+
+// Both providers at once: each run keeps its own slot, so either can be refused
+// (already running) without stopping the other — the log shows each answer.
+function startFull() {
+  var n = countOf(fullScope);
+  if (!confirm('Full refresh of ' + n + ' ticker(s) [' + fullScope + ']:\\n\\n' +
+               '\\u2022 throttled Yahoo/CoinGecko run, roughly ' + throttledMinutes(n) + ' min\\n' +
+               '\\u2022 SEC backfill alongside it, roughly ' + secMinutes(n) + ' min\\n\\nStart both?')) return;
+  launchThrottled(fullScope);
+  launchSec({scope: fullScope});
 }
 
 function stopThrottled() {
@@ -2641,20 +2740,8 @@ function holdThrottled() {
 
 function stopSec() {
   document.getElementById('secStop').disabled = true;
-  log('SEC cancel: the ticker in flight finishes first (up to ~75 s)', 'warn');
+  log('SEC cancel: the ticker in flight finishes first (~5 s)', 'warn');
   post('/update/sec/all/cancel', {}, 'SEC cancel').then(function () { pollSec(); });
-}
-
-function startSec() {
-  var pause = Number(document.getElementById('secPause').value);
-  var raw = (document.getElementById('secTickers').value || '').trim();
-  var body = {pauseSeconds: pause};
-  if (raw) body.tickers = raw.split(',').map(function (s) { return s.trim().toUpperCase(); }).filter(Boolean);
-  if (!confirm('Start SEC backfill' + (body.tickers ? ' for ' + body.tickers.length + ' ticker(s)' : ' for every marketData ticker') + '? This can run for hours.')) return;
-  post('/update/sec/all', body, 'SEC bulk').then(function (r) {
-    if (r.json && r.json.estimatedMinutes != null) log('SEC bulk estimate: ~' + r.json.estimatedMinutes + ' min for ' + r.json.tickers + ' tickers', 'warn');
-    pollSec();
-  });
 }
 
 function renderProgress(barId, progId, s, extra) {
@@ -2676,19 +2763,33 @@ function renderProgress(barId, progId, s, extra) {
 
 var thrTimer = null, secTimer = null, bulkTimer = null;
 // Cursors into the runs' event feeds — only what is new since the last poll is logged.
-var thrSeq = 0, bulkSeq = 0;
+var thrSeq = 0, bulkSeq = 0, secSeq = 0;
+// Full refresh stays off while either of its runs is going.
+var thrRunning = false, secRunning = false;
+function syncFull() { document.getElementById('fullStart').disabled = thrRunning || secRunning; }
+
+// Log a status answer's new events, advancing (or, after a service restart, rewinding) the cursor.
+function drainEvents(s, seq, tag) {
+  if (s.eventSeq != null && s.eventSeq < seq) seq = 0;  // service restarted, seqs began again
+  (s.events || []).forEach(function (e) {
+    log(tag + ': ' + e.message, e.level === 'info' ? '' : e.level);
+    if (e.seq > seq) seq = e.seq;
+  });
+  return seq;
+}
+
+function countsExtra(s) {
+  var extra = '';
+  if (s.updated) extra += ' &middot; ' + s.updated + ' updated';
+  if (s.noData && s.noData.length) extra += ' &middot; <span class="warn">' + s.noData.length + ' no data</span>';
+  return extra;
+}
 
 function pollBulk() {
   fetch('/update/bulk/status?sinceSeq=' + bulkSeq).then(function (r) { return r.json(); }).then(function (s) {
-    if (s.eventSeq != null && s.eventSeq < bulkSeq) bulkSeq = 0;  // service restarted
-    (s.events || []).forEach(function (e) {
-      log('bulk: ' + e.message, e.level === 'info' ? '' : e.level);
-      if (e.seq > bulkSeq) bulkSeq = e.seq;
-    });
+    bulkSeq = drainEvents(s, bulkSeq, 'bulk');
     var extra = s.jobLabel ? ' &middot; ' + esc(s.jobLabel) + (s.scope ? ' [' + esc(s.scope) + ']' : '') : '';
-    if (s.updated) extra += ' &middot; ' + s.updated + ' updated';
-    if (s.noData && s.noData.length) extra += ' &middot; <span class="warn">' + s.noData.length + ' no data</span>';
-    renderProgress('bulkBar', 'bulkProg', s, extra);
+    renderProgress('bulkBar', 'bulkProg', s, extra + countsExtra(s));
     document.getElementById('bulkStop').disabled = !s.running || !!s.cancelRequested;
     clearTimeout(bulkTimer);
     if (s.running) bulkTimer = setTimeout(pollBulk, 2000);
@@ -2698,12 +2799,9 @@ function pollBulk() {
 
 function pollThrottled() {
   fetch('/update/throttled/status?sinceSeq=' + thrSeq).then(function (r) { return r.json(); }).then(function (s) {
-    // Service restarted under us — seqs began again, so rewind the cursor.
-    if (s.eventSeq != null && s.eventSeq < thrSeq) thrSeq = 0;
-    (s.events || []).forEach(function (e) {
-      log('throttled: ' + e.message, e.level === 'info' ? '' : e.level);
-      if (e.seq > thrSeq) thrSeq = e.seq;
-    });
+    thrSeq = drainEvents(s, thrSeq, 'throttled');
+    thrRunning = !!s.running;
+    syncFull();
     var thrExtra = (s.scope ? ' &middot; scope ' + s.scope : '') + (s.updated ? ' &middot; ' + s.updated + ' updated' : '');
     if (s.running && !s.paused && s.remainingSeconds) thrExtra += ' &middot; ~' + Math.round(s.remainingSeconds / 60) + ' min left';
     if (s.paused && s.pausedSeconds) thrExtra += ' &middot; held ' + Math.round(s.pausedSeconds) + ' s';
@@ -2723,16 +2821,16 @@ function pollThrottled() {
 }
 
 function pollSec() {
-  fetch('/update/sec/all/status').then(function (r) { return r.json(); }).then(function (s) {
-    var extra = '';
-    if (s.fundamentalsUpdated || s.sharesUpdated) extra = ' &middot; ' + s.fundamentalsUpdated + ' fundamentals, ' + s.sharesUpdated + ' shares';
-    if (s.noData && s.noData.length) extra += ' &middot; <span class="warn">' + s.noData.length + ' no data</span>';
-    renderProgress('secBar', 'secProg', s, extra);
+  fetch('/update/sec/all/status?sinceSeq=' + secSeq).then(function (r) { return r.json(); }).then(function (s) {
+    secSeq = drainEvents(s, secSeq, 'sec');
+    secRunning = !!s.running;
+    syncFull();
+    renderProgress('secBar', 'secProg', s, (s.scope ? ' &middot; scope ' + esc(s.scope) : '') + countsExtra(s));
     document.getElementById('secStart').disabled = !!s.running;
     document.getElementById('secStop').disabled = !s.running || !!s.cancelRequested;
     clearTimeout(secTimer);
-    // SEC runs are hours long — a slower poll is plenty and keeps the log quiet.
-    if (s.running) secTimer = setTimeout(pollSec, 5000);
+    // ~5 s a ticker, so a slower poll than the Yahoo runs still catches every one.
+    if (s.running) secTimer = setTimeout(pollSec, 3000);
     else loadSummary();
   }).catch(function () { clearTimeout(secTimer); });
 }
@@ -2748,12 +2846,11 @@ function loadSummary() {
     document.getElementById('stats').innerHTML = cells.map(function (c) {
       return '<div class="stat"><div class="k">' + c[0] + '</div><div class="v">' + (c[1] == null ? '\\u2014' : c[1]) + '</div></div>';
     }).join('');
-    var sc = s.scopeCounts || {};
-    document.getElementById('cntQueue').textContent = sc.queue != null ? sc.queue : '\\u2013';
-    document.getElementById('cntHoldings').textContent = sc.holdings != null ? sc.holdings : '\\u2013';
-    document.getElementById('cntAll').textContent = sc.all != null ? sc.all : '\\u2013';
-    document.getElementById('cntHoldingsB').textContent = sc.holdings != null ? sc.holdings : '\\u2013';
-    document.getElementById('cntAllB').textContent = sc.all != null ? sc.all : '\\u2013';
+    scopeCounts = s.scopeCounts || {};
+    [].forEach.call(document.querySelectorAll('[data-cnt]'), function (el) {
+      var v = scopeCounts[el.getAttribute('data-cnt')];
+      el.textContent = v != null ? v : '\\u2013';
+    });
   }).catch(function (e) { log('summary failed: ' + e.message, 'err'); });
 }
 

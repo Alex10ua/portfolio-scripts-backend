@@ -6,9 +6,11 @@ one get 403'd.
 
 Every request goes through _sec_get(), which enforces a process-wide rate limit
 (SEC's fair-access policy caps clients at 10 requests/second and blocks IPs that
-sustain more). One ticker's fundamentals alone costs ~14 requests, so a bulk run
-would blow that limit in the first second without this gate. The default here is
-much slower than SEC allows — see SECONDS_PER_REQUEST.
+sustain more). The default here is much slower than SEC allows — see
+SECONDS_PER_REQUEST.
+
+All XBRL data comes from ONE companyfacts request per company (see
+_fetch_company_facts), not one companyconcept request per tag.
 """
 import os
 import threading
@@ -18,14 +20,15 @@ from datetime import datetime, timedelta
 import requests
 
 TICKER_MAP_URL = 'https://www.sec.gov/files/company_tickers.json'
-CONCEPT_URL = 'https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/{taxonomy}/{tag}.json'
+FACTS_URL = 'https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json'
 
 USER_AGENT = os.getenv('SEC_USER_AGENT', 'FinancePortfolio admin@financeportfolio.local')
 _HEADERS = {'User-Agent': USER_AGENT}
 
 # Seconds to wait between SEC requests. Default 5 s (0.2 req/s) — far below SEC's
 # documented 10 req/s ceiling, which is where blocking starts rather than a target.
-# The cost is real: one ticker's fundamentals is ~15 requests, so ~75 s per ticker.
+# One ticker (fundamentals + shares history) is a single companyfacts request, so
+# ~5 s per ticker; the very first call of the process also loads the CIK map.
 # Override with SEC_SECONDS_PER_REQUEST; 0 disables throttling entirely.
 SECONDS_PER_REQUEST = float(os.getenv('SEC_SECONDS_PER_REQUEST', '5'))
 _MIN_INTERVAL = max(0.0, SECONDS_PER_REQUEST)
@@ -80,28 +83,32 @@ _SHARES_CONCEPTS = [
 
 # Used only when the concepts above come back sparse or stale. A multi-class
 # filer (e.g. MA, GOOG, BRK) tags its cover-page and balance-sheet share counts
-# PER SHARE CLASS — dimensioned facts, which the companyconcept API does not
+# PER SHARE CLASS — dimensioned facts, which SEC's XBRL JSON APIs do not
 # return — so the un-dimensioned series dries up the year the second class
-# appears. MA: us-gaap 404s outright, dei stops after 2010-10-27, 4 facts total.
+# appears. MA: no us-gaap series at all, dei stops after 2010-10-27, 4 facts total.
 # Weighted-average basic shares stay un-dimensioned (EPS is computed on the
 # combined classes) and are filed every quarter — 74 periods for MA, 2007→2026.
 # It is an average over the period, not an as-of count, so it lands within a
 # fraction of a percent of the true figure but is not exact; point-in-time
 # concepts always win a date conflict.
+# CommonStockSharesIssued used to lead this list and must not come back: issued
+# counts treasury stock too (KO 7.0B issued vs 4.3B outstanding, XOM 8.0B vs
+# 4.1B), and TSN's only un-dimensioned fact is a 22.4M class figure from 2008.
 _SHARES_FALLBACK_CONCEPTS = [
-    ('us-gaap', 'CommonStockSharesIssued'),
     ('us-gaap', 'WeightedAverageNumberOfSharesOutstandingBasic'),
 ]
 
 # Below this many point-in-time facts the series is treated as unusable and the
-# fallback concepts are fetched too (2 extra SEC requests for that ticker).
+# fallback concepts are merged in. They cost no request (same companyfacts file);
+# the gate is about data quality — period averages slotted between real counts
+# make a dense series wobble.
 _SHARES_SPARSE_BELOW = 8
 _SHARES_STALE_DAYS = 730
 
 # Curated fundamentals: one internal key -> list of (taxonomy, tag) candidates,
 # since filers drift which exact tag they use across years (e.g. revenue
 # recognition tags changed industry-wide around ASC 606 in 2018). Every
-# candidate is fetched and merged by date (see fetch_fundamentals); a company
+# candidate is read and merged by date (see fetch_fundamentals); a company
 # that never tagged any of a key's candidates simply omits that key.
 FUNDAMENTAL_CONCEPTS = {
     'assets':               [('us-gaap', 'Assets')],
@@ -122,6 +129,12 @@ FUNDAMENTAL_CONCEPTS = {
 }
 
 _cik_map_cache: dict | None = None
+
+# Last companyfacts download, as (cik, monotonic time, facts). A SEC refresh runs
+# fetch_fundamentals and fetch_shares_history back to back on one ticker; this
+# keeps that at one request instead of two.
+_FACTS_CACHE_TTL = 120
+_facts_cache: tuple[str, float, dict | None] | None = None
 
 
 def _load_cik_map() -> dict:
@@ -153,12 +166,40 @@ def _period_days(entry: dict) -> int:
         return 0
 
 
-def _fetch_concept_series(cik: str, taxonomy: str, tag: str, prefer_shortest_period: bool = False) -> list[dict] | None:
+def _fetch_company_facts(cik: str) -> dict | None:
     """
-    Single XBRL concept's full filing history for a CIK, deduped by as-of date
-    (a later filing for the same date wins — amendments/restatements). Returns
-    None when the company never tagged this concept (404) — distinct from an
-    empty list, so callers can fall through to the next tag candidate.
+    Every un-dimensioned XBRL fact SEC holds for a CIK, as
+    {taxonomy: {tag: {'units': {unit: [entry, ...]}}}} — one request per
+    company. None when SEC has no XBRL filings for it (404).
+
+    This replaced one companyconcept request per tag (~16 per ticker). Cost was
+    not the only reason: companyconcept answered 200 with "units": {"shares": {}}
+    for every share concept of KO, and left ABT/XOM/SPGI with a fraction of
+    their fundamentals, while companyfacts held the full series (KO: 71
+    cover-page share counts, 233 weighted averages). Found 2026-10-09.
+    """
+    global _facts_cache
+    cached = _facts_cache
+    if cached and cached[0] == cik and time.monotonic() - cached[1] < _FACTS_CACHE_TTL:
+        return cached[2]
+    response = _sec_get(FACTS_URL.format(cik=cik))
+    if response.status_code == 404:
+        facts = None
+    else:
+        response.raise_for_status()
+        facts = response.json().get('facts') or {}
+    _facts_cache = (cik, time.monotonic(), facts)
+    return facts
+
+
+def _concept_series(facts: dict | None, taxonomy: str, tag: str,
+                    prefer_shortest_period: bool = False, ticker: str = '') -> list[dict] | None:
+    """
+    One XBRL concept's full filing history out of a companyfacts payload,
+    deduped by as-of date (a later filing for the same date wins —
+    amendments/restatements). Returns None when the company never tagged this
+    concept — distinct from an empty list, so callers can fall through to the
+    next tag candidate.
 
     `prefer_shortest_period` matters for duration facts, where one 'end' carries
     both a quarterly and an annual value (Q4 and FY share 12-31). Deduping on
@@ -166,16 +207,16 @@ def _fetch_concept_series(cik: str, taxonomy: str, tag: str, prefer_shortest_per
     landing in an otherwise quarterly series. On it wins the shortest period, so
     the series stays one consistent cadence.
     """
-    url = CONCEPT_URL.format(cik=cik, taxonomy=taxonomy, tag=tag)
-    response = _sec_get(url)
-    if response.status_code == 404:
+    concept = (facts or {}).get(taxonomy, {}).get(tag)
+    if concept is None:
         return None
-    response.raise_for_status()
-    payload = response.json()
 
     by_date: dict[str, dict] = {}
     rank_by_date: dict[str, tuple] = {}
-    for unit_entries in payload.get('units', {}).values():
+    for unit_entries in concept.get('units', {}).values():
+        # SEC has served {} here instead of a list — read as "no facts", loudly below
+        if not isinstance(unit_entries, list):
+            continue
         for entry in unit_entries:
             end_date = entry.get('end')
             val = entry.get('val')
@@ -188,6 +229,10 @@ def _fetch_concept_series(cik: str, taxonomy: str, tag: str, prefer_shortest_per
                 by_date[end_date] = {'date': end_date, 'value': val, 'form': entry.get('form', ''), 'filed': filed}
                 rank_by_date[end_date] = rank
 
+    if not by_date:
+        # A concept SEC lists but holds no facts for is an SEC-side anomaly, not
+        # "never reported" — say so instead of quietly storing nothing.
+        print(f'[sec] WARNING: {ticker or "?"} {taxonomy}:{tag} is listed with no usable facts')
     return [by_date[d] for d in sorted(by_date)]
 
 
@@ -215,18 +260,19 @@ def fetch_shares_history(ticker: str) -> list[dict]:
     cik = get_cik(ticker)
     if not cik:
         return []
+    facts = _fetch_company_facts(cik)
 
     by_date: dict[str, int] = {}
 
     def absorb(concepts):
         for taxonomy, tag in concepts:
-            series = _fetch_concept_series(cik, taxonomy, tag, prefer_shortest_period=True)
+            series = _concept_series(facts, taxonomy, tag, prefer_shortest_period=True, ticker=ticker)
             for entry in series or []:
                 by_date.setdefault(entry['date'], int(entry['value']))
 
     absorb(_SHARES_CONCEPTS)
-    # 2 extra SEC requests, so only for filers whose un-dimensioned series is
-    # unusable — the multi-share-class case (see _SHARES_FALLBACK_CONCEPTS)
+    # only for filers whose un-dimensioned series is unusable — the
+    # multi-share-class case (see _SHARES_FALLBACK_CONCEPTS)
     if _is_sparse(by_date):
         absorb(_SHARES_FALLBACK_CONCEPTS)
 
@@ -258,13 +304,14 @@ def fetch_fundamentals(ticker: str) -> dict:
     cik = get_cik(ticker)
     if not cik:
         return {}
+    facts = _fetch_company_facts(cik)
 
     result = {}
     for concept_key, tag_candidates in FUNDAMENTAL_CONCEPTS.items():
         by_date: dict[str, dict] = {}
         filed_by_date: dict[str, str] = {}
         for taxonomy, tag in tag_candidates:
-            series = _fetch_concept_series(cik, taxonomy, tag, prefer_shortest_period=True)
+            series = _concept_series(facts, taxonomy, tag, prefer_shortest_period=True, ticker=ticker)
             if not series:
                 continue
             for entry in series:

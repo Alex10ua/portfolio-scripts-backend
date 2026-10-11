@@ -403,6 +403,55 @@ class TestRecordSharesHistory(unittest.TestCase):
         updateMarketData.record_shares_history('AAPL', 1000)
 
 
+class TestReplaceSharesHistory(unittest.TestCase):
+    """
+    A stock's share-count history is SEC filings only. Mocked pymongo hands back
+    one MagicMock for every collection, so find_one also answers is_crypto_ticker:
+    None = not crypto.
+    """
+
+    def setUp(self):
+        self.coll = updateMarketData.shares_history_collection
+        self.coll.reset_mock(side_effect=True, return_value=True)
+        self.coll.find_one.return_value = None
+
+    def test_series_replaces_the_doc_sorted(self):
+        stored = updateMarketData.replace_shares_history('KO', [
+            {'date': '2026-04-28', 'shares': 4302482418},
+            {'date': '2009-07-24', 'shares': 2317441658},
+        ])
+        self.assertEqual(stored, 2)
+        args, kwargs = self.coll.update_one.call_args
+        self.assertEqual(args[1]['$set']['history'], [
+            {'date': '2009-07-24', 'shares': 2317441658},
+            {'date': '2026-04-28', 'shares': 4302482418},
+        ])
+        self.assertEqual(args[1]['$set']['lastUpdated'], '2026-04-28')
+        self.assertTrue(kwargs.get('upsert'))
+
+    def test_nothing_is_merged_from_the_stored_doc(self):
+        """Yahoo snapshots used to survive every backfill — GOOGL's class-A-only count among them."""
+        self.coll.find_one.side_effect = [None, {'history': [{'date': '2026-07-31', 'shares': 5_867_000_000}]}]
+        updateMarketData.replace_shares_history('GOOGL', [{'date': '2026-06-30', 'shares': 12_100_000_000}])
+        args, _ = self.coll.update_one.call_args
+        self.assertEqual(args[1]['$set']['history'], [{'date': '2026-06-30', 'shares': 12_100_000_000}])
+
+    def test_no_filings_removes_the_doc(self):
+        self.assertEqual(updateMarketData.replace_shares_history('NSRGY', []), 0)
+        self.coll.delete_one.assert_called_once_with({'_id': 'NSRGY'})
+        self.coll.update_one.assert_not_called()
+
+    def test_crypto_supply_history_is_never_touched(self):
+        self.coll.find_one.return_value = {'ticker': 'ETH', 'assetType': 'CRYPTO'}
+        self.assertEqual(updateMarketData.replace_shares_history('ETH', []), 0)
+        self.coll.delete_one.assert_not_called()
+        self.coll.update_one.assert_not_called()
+
+    def test_db_error_swallowed(self):
+        self.coll.update_one.side_effect = Exception('mongo down')
+        self.assertEqual(updateMarketData.replace_shares_history('KO', [{'date': '2026-01-01', 'shares': 1}]), 0)
+
+
 class TestThrottledRun(unittest.TestCase):
     """
     Pause/resume, per-ticker failure reasons and the streamed event feed. The
@@ -635,7 +684,7 @@ class TestBulkRun(unittest.TestCase):
             calls.append(ticker)
             return outcomes.get(ticker, ('success', {'fields': 3}))
 
-        with patch.dict(updateMarketData.BULK_JOBS, {'fake': (fake_job, 'fake job', 'yahoo')}):
+        with patch.dict(updateMarketData.BULK_JOBS, {'fake': (fake_job, 'fake job')}):
             updateMarketData.run_bulk_task('fake', tickers, 0, 'holdings')
         return calls
 
@@ -687,12 +736,128 @@ class TestBulkRun(unittest.TestCase):
                 updateMarketData.bulk_status["cancelRequested"] = True
             return 'success', {}
 
-        with patch.dict(updateMarketData.BULK_JOBS, {'fake': (fake_job, 'fake job', 'yahoo')}):
+        with patch.dict(updateMarketData.BULK_JOBS, {'fake': (fake_job, 'fake job')}):
             updateMarketData.run_bulk_task('fake', ['A', 'B', 'C'], 0, 'all')
 
         self.assertEqual(self._status('processed'), 1)
         self.assertEqual(self._status('abortedReason'), 'cancelled by user')
         self.assertFalse(self._status('cancelRequested'))
+
+    def test_bulk_offers_only_what_a_throttled_run_does_not_cover(self):
+        # sharesOutstanding duplicated the throttled run; the SEC jobs live in the SEC backfill
+        self.assertEqual(set(updateMarketData.BULK_JOBS), {'statistics', 'financials'})
+
+
+class TestSecBackfill(unittest.TestCase):
+    """
+    The SEC backfill: sec_job reads fundamentals and shares history off one
+    companyfacts download, runs through the same worker as a bulk Yahoo job in its
+    own slot, and takes a holdings/all scope or an explicit list.
+    """
+
+    def setUp(self):
+        with updateMarketData.sec_bulk_lock:
+            updateMarketData.sec_bulk_status.update({
+                "running": False, "scope": None, "total": 0, "processed": 0, "updated": 0,
+                "noData": [], "failed": [], "cancelRequested": False, "abortedReason": None,
+                "events": [],
+            })
+        updateMarketData.fundamentals_collection.reset_mock(side_effect=True, return_value=True)
+        self.sec = updateMarketData.sec_edgar_provider
+
+    def tearDown(self):
+        with updateMarketData.sec_bulk_lock:
+            updateMarketData.sec_bulk_status["running"] = False
+
+    def _status(self, key):
+        with updateMarketData.sec_bulk_lock:
+            return updateMarketData.sec_bulk_status[key]
+
+    def test_sec_job_writes_both_from_one_fetch(self):
+        concepts = {'Revenue': [{'date': '2025-12-31', 'value': 1}], 'Assets': [{'date': '2025-12-31', 'value': 2}]}
+        entries = [{'date': '2024-12-31', 'shares': 10}, {'date': '2025-12-31', 'shares': 9}]
+        with patch.object(self.sec, 'fetch_fundamentals', return_value=concepts), \
+                patch.object(self.sec, 'fetch_shares_history', return_value=entries), \
+                patch.object(updateMarketData, 'replace_shares_history', return_value=2) as replace:
+            status, details = updateMarketData.sec_job('KO')
+
+        self.assertEqual((status, details), ('success', {'concepts': 2, 'sharesPoints': 2}))
+        replace.assert_called_once_with('KO', entries)
+        updateMarketData.fundamentals_collection.update_one.assert_called_once()
+
+    def test_sec_job_without_filings_is_no_data_and_still_clears_history(self):
+        with patch.object(self.sec, 'fetch_fundamentals', return_value={}), \
+                patch.object(self.sec, 'fetch_shares_history', return_value=[]), \
+                patch.object(self.sec, 'get_cik', return_value=None), \
+                patch.object(updateMarketData, 'replace_shares_history', return_value=0) as replace:
+            status, details = updateMarketData.sec_job('ULVR.L')
+
+        self.assertEqual(status, 'no_data')
+        self.assertIn('no CIK', details['reason'])
+        replace.assert_called_once_with('ULVR.L', [])
+        updateMarketData.fundamentals_collection.update_one.assert_not_called()
+
+    def test_sec_job_reports_a_throttle(self):
+        with patch.object(self.sec, 'fetch_fundamentals', side_effect=self.sec.SecThrottled('SEC 429')):
+            status, details = updateMarketData.sec_job('MSFT')
+        self.assertEqual(status, 'rate_limited')
+        self.assertIn('429', details['error'])
+
+    def test_run_goes_through_the_shared_worker(self):
+        outcomes = {
+            'ASML': ('no_data', {'reason': 'no CIK found for ticker (not SEC-registered?)'}),
+            'BAD': ('error', {'error': 'boom'}),
+        }
+        with patch.object(updateMarketData, 'sec_job',
+                          side_effect=lambda t: outcomes.get(t, ('success', {'concepts': 3, 'sharesPoints': 40}))):
+            updateMarketData.run_sec_bulk_task(['ASML', 'BAD', 'KO'], 0, 'holdings')
+
+        self.assertEqual(self._status('scope'), 'holdings')
+        self.assertEqual(self._status('processed'), 3)
+        self.assertEqual(self._status('updated'), 1)
+        self.assertEqual(self._status('noData'), ['ASML'])
+        self.assertEqual([f['ticker'] for f in self._status('failed')], ['BAD'])
+        self.assertFalse(self._status('running'))
+        self.assertTrue(any('KO: updated' in e['message'] for e in self._status('events')))
+
+    def test_rate_limit_aborts_the_run(self):
+        with patch.object(updateMarketData, 'sec_job', return_value=('rate_limited', {'error': 'SEC 403'})) as job:
+            updateMarketData.run_sec_bulk_task(['A', 'B'], 0, 'all')
+        self.assertEqual(job.call_count, 1)
+        self.assertIn('rate-limited at A', self._status('abortedReason'))
+
+    def _start(self, body):
+        with patch.object(updateMarketData.request, 'get_json', return_value=body), \
+                patch.object(updateMarketData.threading, 'Thread') as thread:
+            response = updateMarketData.update_sec_all()
+        return response, thread
+
+    def test_explicit_list_overrides_scope(self):
+        with patch.object(updateMarketData, 'get_custom_tickers', return_value={'S'}):
+            (body, code), thread = self._start({'tickers': ['msft', ' ko ', 'MSFT', 'S'], 'scope': 'holdings'})
+        self.assertEqual(code, 202)
+        self.assertEqual((body['scope'], body['tickers'], body['skippedCustom']), ('list', 2, ['S']))
+        self.assertEqual(thread.call_args.kwargs['args'], [['KO', 'MSFT'], 1.0, 'list'])
+
+    def test_scope_resolves_like_a_throttled_run(self):
+        with patch.object(updateMarketData, 'resolve_throttled_tickers', return_value=(['KO', 'MSFT'], [])) as resolve:
+            (body, code), thread = self._start({'scope': 'holdings', 'pauseSeconds': 0})
+        resolve.assert_called_once_with('holdings')
+        self.assertEqual((code, body['scope'], body['tickers']), (202, 'holdings', 2))
+        self.assertEqual(thread.call_args.kwargs['args'], [['KO', 'MSFT'], 0.0, 'holdings'])
+
+    def test_unknown_scope_is_rejected(self):
+        (body, code), thread = self._start({'scope': 'queue'})
+        self.assertEqual(code, 400)
+        thread.assert_not_called()
+
+    def test_refused_while_a_backfill_runs(self):
+        with updateMarketData.sec_bulk_lock:
+            updateMarketData.sec_bulk_status["running"] = True
+        with patch.object(updateMarketData, 'resolve_throttled_tickers', return_value=(['KO'], [])):
+            (body, code), thread = self._start({'scope': 'all'})
+        self.assertEqual((code, body['status']), (409, 'already_running'))
+        thread.assert_not_called()
 
 
 if __name__ == '__main__':

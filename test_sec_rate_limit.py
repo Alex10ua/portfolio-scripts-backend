@@ -75,14 +75,16 @@ class TestRateLimit(unittest.TestCase):
                 sec._sec_get('https://data.sec.gov/x')
 
     def test_404_is_not_an_error(self):
-        """A concept the filer never tagged — callers fall through to the next tag."""
+        """A company with no XBRL filings — no data, not a failure."""
+        sec._facts_cache = None
         with patch.object(sec, '_MIN_INTERVAL', 0), \
              patch.object(sec.requests, 'get', return_value=_response(404)):
-            self.assertIsNone(sec._fetch_concept_series('0000320193', 'us-gaap', 'Assets'))
+            self.assertIsNone(sec._fetch_company_facts('0000320193'))
 
     def test_throttle_propagates_out_of_fetch_fundamentals(self):
         """Bulk runs rely on this bubbling up so they can abort the whole run."""
         sec._cik_map_cache = {'MSFT': '0000789019'}
+        sec._facts_cache = None
         with patch.object(sec, '_MIN_INTERVAL', 0), \
              patch.object(sec.requests, 'get', return_value=_response(429)):
             with self.assertRaises(sec.SecThrottled):
